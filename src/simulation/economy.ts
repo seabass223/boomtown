@@ -13,6 +13,8 @@ export type EconomyRecipe = {
   durationSeconds: number;
 };
 
+export const LAUNCH_RACK_SLOTS = 6;
+
 export type BuildingEconomyDefinition = {
   accepts: readonly ResourceType[];
   sourceOutputs: readonly ResourceType[];
@@ -27,13 +29,13 @@ export const ECONOMY_RECIPES: Record<EconomyRecipe['id'], EconomyRecipe> = {
   },
   'launch-field': {
     id: 'launch-field',
-    inputs: { wood: 1, stone: 1 },
+    inputs: { wood: 6, stone: 6 },
     outputs: {},
     durationSeconds: 1,
   },
   'launch-rack': {
     id: 'launch-rack',
-    inputs: { wood: 1, stone: 1 },
+    inputs: { wood: 3, stone: 2 },
     outputs: {},
     durationSeconds: 1,
   },

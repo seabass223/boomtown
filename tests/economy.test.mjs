@@ -25,8 +25,8 @@ test('defines the complete v1 resource set and central recipes', () => {
   assert.deepEqual(RESOURCE_TYPES, ['wood', 'water', 'ore', 'stone', 'fireworks']);
   assert.deepEqual(ECONOMY_RECIPES.fireworks.inputs, { wood: 1, water: 1, ore: 1 });
   assert.deepEqual(ECONOMY_RECIPES.fireworks.outputs, { fireworks: 1 });
-  assert.deepEqual(ECONOMY_RECIPES['launch-field'].inputs, { wood: 1, stone: 1 });
-  assert.deepEqual(ECONOMY_RECIPES['launch-rack'].inputs, { wood: 1, stone: 1 });
+  assert.deepEqual(ECONOMY_RECIPES['launch-field'].inputs, { wood: 6, stone: 6 });
+  assert.deepEqual(ECONOMY_RECIPES['launch-rack'].inputs, { wood: 3, stone: 2 });
   assert.deepEqual(getAcceptedResources('fireworksFactory'), ['wood', 'water', 'ore']);
   assert.deepEqual(getAcceptedResources('launchPad'), ['wood', 'stone', 'fireworks']);
 });
@@ -125,6 +125,8 @@ test('reset creates a clean run after every mutable subsystem has changed', () =
   worker.taskState = 'gathering';
   dirty.workers.push(worker);
   dirty.construction.launchFieldProgress.stone = 4;
+  dirty.construction.launchFieldComplete = true;
+  dirty.construction.launchRackProgress.wood = 2;
   dirty.construction.launchRacks = 2;
   dirty.fireworks.produced = 8;
   dirty.fireworks.staged = 6;

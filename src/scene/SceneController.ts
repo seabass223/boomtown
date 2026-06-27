@@ -32,14 +32,24 @@ import {
   type WorkerTaskState,
 } from '../simulation/workerLogistics';
 import {
+  ECONOMY_RECIPES,
+  LAUNCH_RACK_SLOTS,
   addResource,
   getAcceptedResources,
+  getSourceResources,
   inventoryToResourceList,
   removeResource,
   resourceListToInventory,
   transferAcceptedResources,
   type ResourceType,
 } from '../simulation/economy.ts';
+import {
+  deliverToLaunchField,
+  getConstructionFraction,
+  getLaunchCapacity,
+  getLaunchableFireworks,
+  updateFireworksFactory,
+} from '../simulation/buildingProduction.ts';
 import { runFixedSimulationSteps } from '../simulation/fixedStep.ts';
 import {
   createBoomtownRunState,
@@ -1955,6 +1965,8 @@ export class SceneController {
   private simulationMarqueeStart: THREE.Vector2 | null = null;
   private simulationMarqueeAdditive = false;
   private simulationNoticeClearAt = 0;
+  private selectedSimulationBuildingIndex: number | null = null;
+  private readonly simulationBuildingVisuals = new Map<number, THREE.Group>();
   private lastFrameTime = performance.now();
   private readonly resizeObserver: ResizeObserver;
 
@@ -2070,17 +2082,32 @@ export class SceneController {
     this.prefabUi.placeMode = false;
     this.prefabUi.editMode = false;
     this.runState = resetBoomtownRunState();
+    const layoutError = this.getGameplayLayoutError();
+    if (layoutError) {
+      this.canvas.dataset.simulationActive = 'false';
+      this.showSimulationNotice(layoutError);
+      this.canvas.dispatchEvent(new CustomEvent('simulation-state-change'));
+      return;
+    }
     this.runState.clock.running = true;
+    this.canvas.dataset.simulationActive = 'true';
+    this.gui.domElement.hidden = true;
     this.simulationAccumulatorSeconds = 0;
     this.initializeSimulationBuildingInventories();
+    this.createSimulationBuildingVisuals();
+    this.selectedSimulationBuildingIndex =
+      this.placedPrefabs.findIndex((prefab) => prefab.key === 'launchPad');
     this.lastFrameTime = performance.now();
     this.spawnSimulationWorkers();
     this.updateSimulationHud();
     this.updateSimulationSpeedButton();
     document.querySelector<HTMLElement>('.simulation-hud')?.removeAttribute('hidden');
     document.querySelector<HTMLElement>('.simulation-worker-panel')?.removeAttribute('hidden');
+    document.querySelector<HTMLElement>('.simulation-building-panel')?.removeAttribute('hidden');
     document.querySelector<HTMLElement>('.day-modal')?.setAttribute('hidden', '');
     this.updateSimulationWorkerPanel();
+    this.updateSimulationBuildingPanel();
+    this.canvas.dispatchEvent(new CustomEvent('simulation-state-change'));
     this.showSimulationNotice('Select workers, then click a resource building to gather.');
   }
 
@@ -2092,16 +2119,144 @@ export class SceneController {
     this.simulationMarqueeStart = null;
     this.simulationMarqueeAdditive = false;
     this.clearSimulationWorkers();
+    this.clearSimulationBuildingVisuals();
     this.runState.buildings.clear();
+    this.selectedSimulationBuildingIndex = null;
+    delete this.canvas.dataset.simulationActive;
+    this.gui.domElement.hidden = false;
     document.querySelector<HTMLElement>('.simulation-hud')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.simulation-worker-panel')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.simulation-building-panel')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.simulation-notice')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.selection-marquee')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.day-modal')?.setAttribute('hidden', '');
+    this.canvas.dispatchEvent(new CustomEvent('simulation-state-change'));
+  }
+
+  private getGameplayLayoutError(): string | null {
+    const mismatches = PREFAB_BUILDINGS.flatMap((definition) => {
+      const actual = this.getPlacedPrefabCount(definition.key);
+      return actual === definition.requiredCount
+        ? []
+        : [`${definition.label} (${actual}/${definition.requiredCount})`];
+    });
+    if (mismatches.length > 0) {
+      return `Cannot start run. Load the Full Build layout; invalid building counts: ${mismatches.join(', ')}.`;
+    }
+    if (!this.walkwayPathGraph) {
+      return 'Cannot start run. The Full Build layout needs a generated path graph.';
+    }
+    const connectedBuildings = new Set(
+      this.walkwayPathGraph.nodes
+        .map((node) => node.buildingIndex)
+        .filter((index): index is number => index !== undefined),
+    );
+    if (this.placedPrefabs.some((_, index) => !connectedBuildings.has(index))) {
+      return 'Cannot start run. Regenerate the Full Build paths so every building is connected.';
+    }
+    return null;
   }
 
   private initializeSimulationBuildingInventories(): void {
     initializeRunBuildings(this.runState, this.placedPrefabs.length);
+  }
+
+  private createSimulationBuildingVisuals(): void {
+    this.clearSimulationBuildingVisuals();
+    this.placedPrefabs.forEach((prefab, buildingIndex) => {
+      if (prefab.key !== 'launchPad' && prefab.key !== 'fireworksFactory') {
+        return;
+      }
+      const definition = getPrefabDefinition(prefab.key);
+      const center = getPrefabWorldCenter(definition, prefab.placement);
+      const visual = new THREE.Group();
+      visual.name = `${definition.label} simulation progress`;
+      visual.position.set(center.x, this.settings.rockHeight + definition.dimensions.height + 0.65, center.y);
+
+      const background = new THREE.Mesh(
+        new THREE.BoxGeometry(1.25, 0.12, 0.08),
+        new THREE.MeshBasicMaterial({ color: 0x26363c }),
+      );
+      const fill = new THREE.Mesh(
+        new THREE.BoxGeometry(1.18, 0.075, 0.09),
+        new THREE.MeshBasicMaterial({ color: prefab.key === 'launchPad' ? 0xf4d17a : 0x68bb73 }),
+      );
+      fill.name = 'Progress fill';
+      fill.position.z = 0.01;
+      fill.scale.x = 0.001;
+      fill.position.x = -0.59;
+      visual.add(background, fill);
+      this.simulationLayer.add(visual);
+      this.simulationBuildingVisuals.set(buildingIndex, visual);
+    });
+    this.updateSimulationBuildingVisuals();
+  }
+
+  private clearSimulationBuildingVisuals(): void {
+    this.simulationBuildingVisuals.forEach((visual) => {
+      visual.traverse((object) => {
+        const mesh = object as THREE.Mesh;
+        mesh.geometry?.dispose();
+        if (Array.isArray(mesh.material)) {
+          mesh.material.forEach((material) => material.dispose());
+        } else {
+          mesh.material?.dispose();
+        }
+      });
+      visual.removeFromParent();
+    });
+    this.simulationBuildingVisuals.clear();
+  }
+
+  private updateSimulationBuildingVisuals(): void {
+    this.simulationBuildingVisuals.forEach((visual, buildingIndex) => {
+      const prefab = this.placedPrefabs[buildingIndex];
+      const fill = visual.getObjectByName('Progress fill') as THREE.Mesh | undefined;
+      if (!prefab || !fill) {
+        return;
+      }
+      const building = this.runState.buildings.get(buildingIndex);
+      const progress = prefab.key === 'launchPad'
+        ? this.runState.construction.launchFieldComplete
+          ? getConstructionFraction(
+              this.runState.construction.launchRackProgress,
+              ECONOMY_RECIPES['launch-rack'].inputs,
+            )
+          : getConstructionFraction(
+              this.runState.construction.launchFieldProgress,
+              ECONOMY_RECIPES['launch-field'].inputs,
+            )
+        : Math.min(
+            1,
+            (building?.productionProgressSeconds ?? 0) /
+              ECONOMY_RECIPES.fireworks.durationSeconds,
+          );
+      fill.scale.x = Math.max(0.001, progress);
+      fill.position.x = -0.59 + (1.18 * progress) / 2;
+
+      if (prefab.key === 'launchPad') {
+        const rackCount = visual.children.filter((child) => child.name === 'Completed launch rack').length;
+        for (let index = rackCount; index < this.runState.construction.launchRacks; index += 1) {
+          const rack = new THREE.Group();
+          rack.name = 'Completed launch rack';
+          const base = new THREE.Mesh(
+            new THREE.BoxGeometry(0.42, 0.09, 0.32),
+            new THREE.MeshStandardMaterial({ color: 0x6f5741, roughness: 0.8 }),
+          );
+          rack.add(base);
+          for (const offset of [-0.12, 0, 0.12]) {
+            const rocket = new THREE.Mesh(
+              new THREE.CylinderGeometry(0.025, 0.025, 0.36, 8),
+              new THREE.MeshStandardMaterial({ color: offset === 0 ? 0xf4f0df : 0xb9584d }),
+            );
+            rocket.position.set(offset, 0.2, 0);
+            rack.add(rocket);
+          }
+          rack.position.set((index % 3) * 0.52 - 0.52, -0.5, Math.floor(index / 3) * 0.42);
+          visual.add(rack);
+        }
+      }
+    });
   }
 
   private spawnSimulationWorkers(): void {
@@ -2416,11 +2571,17 @@ export class SceneController {
     }
 
     const cargoInventory = resourceListToInventory(worker.state.cargo);
-    const transferredAmounts = transferAcceptedResources(
-      cargoInventory,
-      getRunBuildingInventory(this.runState, buildingIndex, 'input'),
-      getAcceptedResources(prefab.key),
-    );
+    const transferredAmounts = prefab.key === 'launchPad'
+      ? deliverToLaunchField(
+          this.runState,
+          cargoInventory,
+          getRunBuildingInventory(this.runState, buildingIndex, 'input'),
+        ).transferred
+      : transferAcceptedResources(
+          cargoInventory,
+          getRunBuildingInventory(this.runState, buildingIndex, 'input'),
+          getAcceptedResources(prefab.key),
+        );
     const transferred = inventoryToResourceList({
       wood: transferredAmounts.wood ?? 0,
       water: transferredAmounts.water ?? 0,
@@ -2437,6 +2598,8 @@ export class SceneController {
     } else {
       this.showSimulationNotice(`${this.getBuildingLabel(buildingIndex)} does not accept this worker's cargo.`);
     }
+    this.updateSimulationBuildingVisuals();
+    this.updateSimulationBuildingPanel();
   }
 
   private finishWorkerOrder(worker: SimulationWorker): void {
@@ -2543,11 +2706,53 @@ export class SceneController {
     }
 
     this.updateSimulationWorkers(deltaSeconds);
+    this.updateBuildingProduction(deltaSeconds);
     if (exactMinutes >= SIMULATION_DAY_MINUTES) {
       this.runState.clock.clockMinutes = SIMULATION_DAY_MINUTES;
       this.updateSimulationHud();
       this.finishSimulationDay();
     }
+  }
+
+  private getAssignedWorkerCount(buildingIndex: number, role: 'source' | 'destination'): number {
+    return this.simulationWorkers.filter((worker) => {
+      if (role === 'source' && worker.state.loop?.sourceBuildingIndex === buildingIndex) {
+        return true;
+      }
+      if (role === 'destination' && worker.state.loop?.destinationBuildingIndex === buildingIndex) {
+        return true;
+      }
+      return worker.state.targetBuildingIndex === buildingIndex &&
+        (role === 'source'
+          ? worker.state.orderAction === 'gather'
+          : worker.state.orderAction === 'deliver' || worker.state.taskState === 'producing-building');
+    }).length;
+  }
+
+  private updateBuildingProduction(deltaSeconds: number): void {
+    this.placedPrefabs.forEach((prefab, buildingIndex) => {
+      const building = this.runState.buildings.get(buildingIndex);
+      if (!building) {
+        return;
+      }
+      building.activeWorkers = this.getAssignedWorkerCount(
+        buildingIndex,
+        prefab.key === 'fireworksFactory' ? 'destination' : 'source',
+      );
+      if (prefab.key !== 'fireworksFactory') {
+        return;
+      }
+      const produced = updateFireworksFactory(
+        building,
+        deltaSeconds,
+        building.activeWorkers,
+      );
+      if (produced > 0) {
+        this.runState.fireworks.produced += produced;
+      }
+    });
+    this.updateSimulationBuildingVisuals();
+    this.updateSimulationBuildingPanel();
   }
 
   private updateSimulationWorkers(deltaSeconds: number): void {
@@ -2687,10 +2892,23 @@ export class SceneController {
   private finishSimulationDay(): void {
     this.runState.clock.paused = true;
     this.simulationWorkers.forEach((worker) => this.setWorkerSelected(worker, false));
+    if (this.runState.clock.day >= SIMULATION_FINAL_DAY) {
+      const launchableFireworks = getLaunchableFireworks(this.runState);
+      this.runState.result = {
+        success: launchableFireworks >= this.runState.objective.minimumLaunchableFireworks,
+        launchableFireworks,
+      };
+    }
     const modal = document.querySelector<HTMLElement>('.day-modal');
     const title = document.querySelector<HTMLElement>('#day-modal-title');
+    const summary = document.querySelector<HTMLElement>('.day-modal__summary');
     if (title) {
       title.textContent = this.runState.clock.day >= SIMULATION_FINAL_DAY ? 'Game Over' : "Today's progress";
+    }
+    if (summary) {
+      summary.textContent = this.runState.result
+        ? `${this.runState.result.launchableFireworks} staged fireworks can launch from ${this.runState.construction.launchRacks} racks.`
+        : `${this.runState.fireworks.produced} fireworks produced · ${this.runState.fireworks.staged} staged · ${getLaunchCapacity(this.runState)} launch capacity`;
     }
     modal?.removeAttribute('hidden');
     document.querySelector<HTMLButtonElement>('.day-modal__button')?.focus();
@@ -2738,6 +2956,84 @@ export class SceneController {
     detail.textContent = pendingLoop
       ? `${states} · choose Shift-loop destination`
       : `${states} · ${summarizeResources(cargo)}${activeLoops > 0 ? ` · ${activeLoops} looping` : ''}`;
+  }
+
+  private updateSimulationBuildingPanel(): void {
+    const title = document.querySelector<HTMLElement>('.simulation-building-panel__title');
+    const status = document.querySelector<HTMLElement>('.simulation-building-panel__status');
+    const detail = document.querySelector<HTMLElement>('.simulation-building-panel__detail');
+    const metrics = document.querySelector<HTMLElement>('.simulation-building-panel__metrics');
+    const progress = document.querySelector<HTMLElement>('.simulation-building-panel__progress-fill');
+    if (!title || !status || !detail || !metrics || !progress) {
+      return;
+    }
+
+    const buildingIndex = this.selectedSimulationBuildingIndex;
+    const prefab = buildingIndex === null ? null : this.placedPrefabs[buildingIndex];
+    const building = buildingIndex === null ? null : this.runState.buildings.get(buildingIndex);
+    if (!prefab || !building) {
+      title.textContent = 'Town production';
+      status.textContent = 'Click a building to inspect it';
+      detail.textContent = '';
+      metrics.textContent = '';
+      progress.style.width = '0%';
+      return;
+    }
+
+    const definition = getPrefabDefinition(prefab.key);
+    title.textContent = definition.label;
+    if (getSourceResources(prefab.key).length > 0 && prefab.key !== 'fireworksFactory') {
+      const sources = getSourceResources(prefab.key).join(' + ');
+      status.textContent = `Renewable source · ${building.activeWorkers} assigned`;
+      detail.textContent = prefab.key === 'quarry'
+        ? 'Shift-loop to Factory gathers ore; Shift-loop to Launch Field gathers stone. One-shot work alternates.'
+        : `Workers gather ${sources} until their 3-slot cargo is full.`;
+      metrics.textContent = `Output: ${sources}`;
+      progress.style.width = `${Math.min(100, building.activeWorkers * 25)}%`;
+      return;
+    }
+
+    if (prefab.key === 'fireworksFactory') {
+      const recipe = ECONOMY_RECIPES.fireworks;
+      status.textContent = `${building.activeWorkers} assigned · ${building.output.fireworks} ready to haul`;
+      detail.textContent = `Consumes ${recipe.inputs.wood} wood + ${recipe.inputs.water} water + ${recipe.inputs.ore} ore per firework.`;
+      metrics.textContent =
+        `Inputs: ${building.input.wood} wood · ${building.input.water} water · ${building.input.ore} ore`;
+      progress.style.width =
+        `${Math.min(100, (building.productionProgressSeconds / recipe.durationSeconds) * 100)}%`;
+      return;
+    }
+
+    if (prefab.key === 'launchPad') {
+      const complete = this.runState.construction.launchFieldComplete;
+      const recipe = complete ? ECONOMY_RECIPES['launch-rack'] : ECONOMY_RECIPES['launch-field'];
+      const current = complete
+        ? this.runState.construction.launchRackProgress
+        : this.runState.construction.launchFieldProgress;
+      const capacity = getLaunchCapacity(this.runState);
+      const launchable = getLaunchableFireworks(this.runState);
+      const overflow = Math.max(0, this.runState.fireworks.staged - capacity);
+      status.textContent = complete
+        ? `${this.runState.construction.launchRacks} racks · ${capacity} launch slots`
+        : 'Launch Field construction site';
+      detail.textContent =
+        `Next ${complete ? 'rack' : 'field'}: ${current.wood}/${recipe.inputs.wood ?? 0} wood · ` +
+        `${current.stone}/${recipe.inputs.stone ?? 0} stone`;
+      metrics.textContent =
+        `Staged: ${this.runState.fireworks.staged} · Launchable: ${launchable}` +
+        (overflow > 0 ? ` · ${overflow} over capacity` : '') +
+        (complete ? ` · ${LAUNCH_RACK_SLOTS} slots/rack` : '');
+      progress.style.width =
+        `${getConstructionFraction(current, recipe.inputs) * 100}%`;
+      return;
+    }
+
+    status.textContent = prefab.key === 'house' ? 'Worker home' : 'Town landmark';
+    detail.textContent = prefab.key === 'house'
+      ? 'Two workers leave this house each morning.'
+      : 'No production role in the v1 economy.';
+    metrics.textContent = '';
+    progress.style.width = '0%';
   }
 
   private showSimulationNotice(message: string): void {
@@ -4102,9 +4398,14 @@ export class SceneController {
     }
 
     const selectedWorkers = this.simulationWorkers.filter((worker) => worker.selected);
-    const buildingIndex = selectedWorkers.length > 0 ? this.getPrefabIndexAtPointer(event) : null;
+    const buildingIndex = this.getPrefabIndexAtPointer(event);
     if (buildingIndex !== null) {
       event.preventDefault();
+      this.selectedSimulationBuildingIndex = buildingIndex;
+      this.updateSimulationBuildingPanel();
+      if (selectedWorkers.length === 0) {
+        return;
+      }
       if (event.shiftKey) {
         this.issueShiftBuildingOrder(selectedWorkers, buildingIndex);
       } else {

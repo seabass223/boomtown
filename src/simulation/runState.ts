@@ -22,6 +22,8 @@ export type WorkerRunState = {
 export type BuildingRunState = {
   input: ResourceInventory;
   output: ResourceInventory;
+  productionProgressSeconds: number;
+  activeWorkers: number;
 };
 
 export type BoomtownRunState = {
@@ -38,6 +40,8 @@ export type BoomtownRunState = {
   workers: WorkerRunState[];
   construction: {
     launchFieldProgress: ResourceInventory;
+    launchFieldComplete: boolean;
+    launchRackProgress: ResourceInventory;
     launchRacks: number;
   };
   fireworks: {
@@ -71,6 +75,8 @@ export function createBuildingRunState(): BuildingRunState {
   return {
     input: createEmptyInventory(),
     output: createEmptyInventory(),
+    productionProgressSeconds: 0,
+    activeWorkers: 0,
   };
 }
 
@@ -89,6 +95,8 @@ export function createBoomtownRunState(): BoomtownRunState {
     workers: [],
     construction: {
       launchFieldProgress: createEmptyInventory(),
+      launchFieldComplete: false,
+      launchRackProgress: createEmptyInventory(),
       launchRacks: 0,
     },
     fireworks: {

@@ -42,11 +42,21 @@
         <strong class="simulation-worker-panel__summary">0 workers · none selected</strong>
         <span class="simulation-worker-panel__detail">Click a worker or drag a box to select</span>
       </section>
+      <section class="simulation-building-panel" aria-live="polite" hidden>
+        <strong class="simulation-building-panel__title">Town production</strong>
+        <span class="simulation-building-panel__status">Click a building to inspect it</span>
+        <div class="simulation-building-panel__progress" aria-hidden="true">
+          <span class="simulation-building-panel__progress-fill"></span>
+        </div>
+        <span class="simulation-building-panel__detail"></span>
+        <span class="simulation-building-panel__metrics"></span>
+      </section>
       <div class="simulation-notice" role="status" hidden></div>
       <div class="selection-marquee" hidden></div>
       <div class="day-modal" role="dialog" aria-modal="true" aria-labelledby="day-modal-title" hidden>
         <div class="day-modal__panel">
           <h2 id="day-modal-title">Today's progress</h2>
+          <p class="day-modal__summary"></p>
           <button class="day-modal__button" type="button">OK</button>
         </div>
       </div>

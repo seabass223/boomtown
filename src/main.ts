@@ -29,6 +29,17 @@ canvas.addEventListener('scene-mode-change', (event) => {
     button.classList.toggle('is-active', selected);
     button.setAttribute('aria-pressed', String(selected));
   });
+  toolbar?.classList.toggle(
+    'is-gameplay-locked',
+    mode === 'simulate' && canvas.dataset.simulationActive === 'true',
+  );
+});
+
+canvas.addEventListener('simulation-state-change', () => {
+  toolbar?.classList.toggle(
+    'is-gameplay-locked',
+    canvas.dataset.simulationActive === 'true',
+  );
 });
 
 dayModalButton?.addEventListener('click', () => {
