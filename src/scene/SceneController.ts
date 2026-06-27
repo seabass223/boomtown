@@ -21,6 +21,19 @@ import {
   getPrefabWorldCenter,
   getPrefabWorldFootprintCorners,
 } from './PrefabBuildings';
+import {
+  WORKER_CARGO_CAPACITY,
+  acceptsAnyCargo,
+  canCreateLoop,
+  getGatheredResource,
+  isResourceSource,
+  summarizeResources,
+  transferAcceptedCargo,
+  type ResourceType,
+  type WorkerLoop,
+  type WorkerOrderAction,
+  type WorkerTaskState,
+} from '../simulation/workerLogistics';
 
 type RockVariantType = 'block' | 'wide' | 'trapezoid' | 'narrow';
 
@@ -201,12 +214,21 @@ type WalkwayPathGraph = {
 
 type SimulationWorker = {
   mesh: THREE.Mesh<THREE.BoxGeometry, THREE.MeshStandardMaterial>;
+  baseColor: number;
   homeBuildingIndex: number;
   currentNodeId: string;
   routeNodeIds: string[];
   routeIndex: number;
   selected: boolean;
   speed: number;
+  cargo: ResourceType[];
+  taskState: WorkerTaskState;
+  orderAction: WorkerOrderAction | null;
+  targetBuildingIndex: number | null;
+  taskProgressSeconds: number;
+  loop: WorkerLoop | null;
+  pendingLoopSourceBuildingIndex: number | null;
+  quarryFallback: 'ore' | 'stone';
 };
 
 type GrassTexturePathOverlay = {
@@ -229,7 +251,18 @@ const SIMULATION_RETURN_MINUTE = 11 * 60 + 50;
 const SIMULATION_MINUTES_PER_REAL_SECOND = 3;
 const SIMULATION_CLOCK_STEP_MINUTES = 10;
 const SIMULATION_WORKER_SPEED = 0.82;
+const SIMULATION_GATHER_SECONDS = 1.4;
+const SIMULATION_BUILDING_WORK_SECONDS = 0.3;
+const SIMULATION_CLICK_DISTANCE = 5;
 const SIMULATION_FINAL_DAY = 4;
+const WORKER_STATE_COLORS: Record<WorkerTaskState, number> = {
+  idle: 0xffffff,
+  traveling: 0x62a9d8,
+  gathering: 0x68bb73,
+  delivering: 0xe5a43c,
+  'producing-building': 0xba78d1,
+  'returning-home': 0x9099a2,
+};
 const ROCK_GEOMETRIES = new Map<string, THREE.BufferGeometry>();
 const TREE_GEOMETRIES = new Map<string, THREE.BufferGeometry>();
 const VIBE_PRESET_NAMES: VibePresetName[] = [
@@ -1879,6 +1912,7 @@ export class SceneController {
   private prefabPreviewWorldPosition: THREE.Vector2 | null = null;
   private interactionMode: SceneInteractionMode = 'pan';
   private readonly simulationWorkers: SimulationWorker[] = [];
+  private readonly simulationBuildingInventories = new Map<number, Map<ResourceType, number>>();
   private simulationDay = 1;
   private simulationElapsedRealSeconds = 0;
   private simulationClockMinutes = 0;
@@ -1888,6 +1922,8 @@ export class SceneController {
   private simulationSpeed: 1 | 2 | 4 | 8 = 1;
   private simulationMarqueePointerId: number | null = null;
   private simulationMarqueeStart: THREE.Vector2 | null = null;
+  private simulationMarqueeAdditive = false;
+  private simulationNoticeClearAt = 0;
   private lastFrameTime = performance.now();
   private readonly resizeObserver: ResizeObserver;
 
@@ -1979,6 +2015,7 @@ export class SceneController {
     this.clearSimulationWorkers();
     this.spawnSimulationWorkers();
     this.updateSimulationHud();
+    this.showSimulationNotice(`July ${this.simulationDay}: assign fresh duties for the new workday.`);
   }
 
   public cycleSimulationSpeed(): void {
@@ -2007,12 +2044,16 @@ export class SceneController {
     this.simulationPaused = false;
     this.simulationSpeed = 1;
     this.simulationRunning = true;
+    this.initializeSimulationBuildingInventories();
     this.lastFrameTime = performance.now();
     this.spawnSimulationWorkers();
     this.updateSimulationHud();
     this.updateSimulationSpeedButton();
     document.querySelector<HTMLElement>('.simulation-hud')?.removeAttribute('hidden');
+    document.querySelector<HTMLElement>('.simulation-worker-panel')?.removeAttribute('hidden');
     document.querySelector<HTMLElement>('.day-modal')?.setAttribute('hidden', '');
+    this.updateSimulationWorkerPanel();
+    this.showSimulationNotice('Select workers, then click a resource building to gather.');
   }
 
   private stopSimulation(): void {
@@ -2020,10 +2061,21 @@ export class SceneController {
     this.simulationPaused = false;
     this.simulationMarqueePointerId = null;
     this.simulationMarqueeStart = null;
+    this.simulationMarqueeAdditive = false;
     this.clearSimulationWorkers();
+    this.simulationBuildingInventories.clear();
     document.querySelector<HTMLElement>('.simulation-hud')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.simulation-worker-panel')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.simulation-notice')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.selection-marquee')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.day-modal')?.setAttribute('hidden', '');
+  }
+
+  private initializeSimulationBuildingInventories(): void {
+    this.simulationBuildingInventories.clear();
+    this.placedPrefabs.forEach((_prefab, buildingIndex) => {
+      this.simulationBuildingInventories.set(buildingIndex, new Map());
+    });
   }
 
   private spawnSimulationWorkers(): void {
@@ -2049,8 +2101,9 @@ export class SceneController {
       const pathDirection = neighborPosition.sub(homePosition).normalize();
 
       for (let workerIndex = 0; workerIndex < 2; workerIndex += 1) {
+        const baseColor = workerIndex === 0 ? 0x3f78a8 : 0xb9584d;
         const material = new THREE.MeshStandardMaterial({
-          color: workerIndex === 0 ? 0x3f78a8 : 0xb9584d,
+          color: baseColor,
           roughness: 0.78,
         });
         const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.4, 0.22), material);
@@ -2065,15 +2118,25 @@ export class SceneController {
         this.simulationLayer.add(mesh);
         this.simulationWorkers.push({
           mesh,
+          baseColor,
           homeBuildingIndex: buildingIndex,
           currentNodeId: homeNode.id,
           routeNodeIds: [],
           routeIndex: 0,
           selected: false,
           speed: SIMULATION_WORKER_SPEED,
+          cargo: [],
+          taskState: 'idle',
+          orderAction: null,
+          targetBuildingIndex: null,
+          taskProgressSeconds: 0,
+          loop: null,
+          pendingLoopSourceBuildingIndex: null,
+          quarryFallback: 'ore',
         });
       }
     });
+    this.updateSimulationWorkerPanel();
   }
 
   private clearSimulationWorkers(): void {
@@ -2083,6 +2146,7 @@ export class SceneController {
       worker.mesh.material.dispose();
     });
     this.simulationWorkers.length = 0;
+    this.updateSimulationWorkerPanel();
   }
 
   private getBuildingPathNode(buildingIndex: number): WalkwayPathNode | null {
@@ -2143,35 +2207,262 @@ export class SceneController {
     return path;
   }
 
-  private routeWorkerToBuilding(worker: SimulationWorker, buildingIndex: number): void {
+  private routeWorkerToBuilding(worker: SimulationWorker, buildingIndex: number): boolean {
     const destinationNode = this.getBuildingPathNode(buildingIndex);
     if (!destinationNode) {
-      return;
+      return false;
     }
 
     const currentTargetId = worker.routeNodeIds[worker.routeIndex];
     const anchorNodeId = currentTargetId ?? worker.currentNodeId;
     const path = this.findPathNodeIds(anchorNodeId, destinationNode.id);
     if (path.length === 0) {
-      return;
+      return false;
     }
 
     worker.routeNodeIds = currentTargetId || path.length === 1 ? path : path.slice(1);
     worker.routeIndex = 0;
     worker.speed = SIMULATION_WORKER_SPEED;
+    return true;
+  }
+
+  private setWorkerTaskState(worker: SimulationWorker, state: WorkerTaskState): void {
+    worker.taskState = state;
+    const stateColor = WORKER_STATE_COLORS[state];
+    worker.mesh.material.color.setHex(state === 'idle' ? worker.baseColor : stateColor);
+    this.updateSimulationWorkerPanel();
+  }
+
+  private beginWorkerOrder(
+    worker: SimulationWorker,
+    buildingIndex: number,
+    action: WorkerOrderAction,
+    preserveLoop = false,
+  ): boolean {
+    if (!preserveLoop) {
+      worker.loop = null;
+      worker.pendingLoopSourceBuildingIndex = null;
+    }
+    if (!this.routeWorkerToBuilding(worker, buildingIndex)) {
+      worker.orderAction = null;
+      worker.targetBuildingIndex = null;
+      this.setWorkerTaskState(worker, 'idle');
+      return false;
+    }
+
+    worker.orderAction = action;
+    worker.targetBuildingIndex = buildingIndex;
+    worker.taskProgressSeconds = 0;
+    this.setWorkerTaskState(
+      worker,
+      action === 'return-home' ? 'returning-home' : action === 'deliver' ? 'delivering' : 'traveling',
+    );
+    return true;
+  }
+
+  private getBuildingLabel(buildingIndex: number): string {
+    const prefab = this.placedPrefabs[buildingIndex];
+    return prefab ? getPrefabDefinition(prefab.key).label : 'building';
+  }
+
+  private getBuildingInventory(buildingIndex: number): Map<ResourceType, number> {
+    let inventory = this.simulationBuildingInventories.get(buildingIndex);
+    if (!inventory) {
+      inventory = new Map();
+      this.simulationBuildingInventories.set(buildingIndex, inventory);
+    }
+    return inventory;
+  }
+
+  private getBuildingResourceCount(buildingIndex: number, resource: ResourceType): number {
+    return this.getBuildingInventory(buildingIndex).get(resource) ?? 0;
+  }
+
+  private addBuildingResource(buildingIndex: number, resource: ResourceType, amount: number): void {
+    const inventory = this.getBuildingInventory(buildingIndex);
+    inventory.set(resource, Math.max(0, (inventory.get(resource) ?? 0) + amount));
+  }
+
+  private canGatherAtBuilding(worker: SimulationWorker, buildingIndex: number): boolean {
+    const prefab = this.placedPrefabs[buildingIndex];
+    if (!prefab || !isResourceSource(prefab.key) || worker.cargo.length >= WORKER_CARGO_CAPACITY) {
+      return false;
+    }
+    return prefab.key !== 'fireworksFactory' || this.getBuildingResourceCount(buildingIndex, 'fireworks') > 0;
+  }
+
+  private issueOneShotWorkerOrder(worker: SimulationWorker, buildingIndex: number): 'gather' | 'deliver' | 'invalid' {
+    const prefab = this.placedPrefabs[buildingIndex];
+    if (!prefab) {
+      return 'invalid';
+    }
+
+    if (acceptsAnyCargo(prefab.key, worker.cargo)) {
+      return this.beginWorkerOrder(worker, buildingIndex, 'deliver') ? 'deliver' : 'invalid';
+    }
+    if (this.canGatherAtBuilding(worker, buildingIndex)) {
+      return this.beginWorkerOrder(worker, buildingIndex, 'gather') ? 'gather' : 'invalid';
+    }
+    return 'invalid';
+  }
+
+  private issueOneShotBuildingOrder(workers: SimulationWorker[], buildingIndex: number): void {
+    let gathering = 0;
+    let delivering = 0;
+    workers.forEach((worker) => {
+      const result = this.issueOneShotWorkerOrder(worker, buildingIndex);
+      gathering += result === 'gather' ? 1 : 0;
+      delivering += result === 'deliver' ? 1 : 0;
+    });
+
+    const label = this.getBuildingLabel(buildingIndex);
+    if (gathering > 0) {
+      this.showSimulationNotice(`${gathering} worker${gathering === 1 ? '' : 's'} gathering at ${label}.`);
+    } else if (delivering > 0) {
+      this.showSimulationNotice(`${delivering} worker${delivering === 1 ? '' : 's'} delivering to ${label}.`);
+    } else {
+      this.showSimulationNotice(`No selected worker can gather from or deliver to ${label}.`);
+    }
+  }
+
+  private issueShiftBuildingOrder(workers: SimulationWorker[], buildingIndex: number): void {
+    const clickedPrefab = this.placedPrefabs[buildingIndex];
+    if (!clickedPrefab) {
+      return;
+    }
+
+    const awaitingDestination = workers.some((worker) => worker.pendingLoopSourceBuildingIndex !== null);
+    if (!awaitingDestination) {
+      if (!isResourceSource(clickedPrefab.key)) {
+        this.showSimulationNotice('Shift-loop step 1 must be a resource source.');
+        return;
+      }
+      workers.forEach((worker) => {
+        worker.pendingLoopSourceBuildingIndex = buildingIndex;
+        worker.loop = null;
+      });
+      this.updateSimulationWorkerPanel();
+      this.showSimulationNotice(`Loop source set to ${this.getBuildingLabel(buildingIndex)}. Shift-click a destination.`);
+      return;
+    }
+
+    let created = 0;
+    workers.forEach((worker) => {
+      const sourceBuildingIndex = worker.pendingLoopSourceBuildingIndex;
+      const sourcePrefab = sourceBuildingIndex === null ? null : this.placedPrefabs[sourceBuildingIndex];
+      worker.pendingLoopSourceBuildingIndex = null;
+      if (
+        sourceBuildingIndex === null ||
+        !sourcePrefab ||
+        !canCreateLoop(sourcePrefab.key, clickedPrefab.key)
+      ) {
+        return;
+      }
+
+      worker.loop = { sourceBuildingIndex, destinationBuildingIndex: buildingIndex };
+      if (this.beginWorkerOrder(worker, sourceBuildingIndex, 'gather', true)) {
+        created += 1;
+      } else {
+        worker.loop = null;
+      }
+    });
+
+    this.updateSimulationWorkerPanel();
+    if (created > 0) {
+      this.showSimulationNotice(
+        `${created} harvest loop${created === 1 ? '' : 's'} assigned to ${this.getBuildingLabel(buildingIndex)}.`,
+      );
+    } else {
+      this.showSimulationNotice('That source cannot supply a resource accepted by this destination.');
+    }
+  }
+
+  private completeWorkerDelivery(worker: SimulationWorker, buildingIndex: number): void {
+    const prefab = this.placedPrefabs[buildingIndex];
+    if (!prefab) {
+      this.finishWorkerOrder(worker);
+      return;
+    }
+
+    const { remaining, transferred } = transferAcceptedCargo(worker.cargo, prefab.key);
+    worker.cargo = remaining;
+    transferred.forEach((resource) => this.addBuildingResource(buildingIndex, resource, 1));
+    worker.taskProgressSeconds = 0;
+    this.setWorkerTaskState(worker, 'producing-building');
+
+    if (transferred.length > 0) {
+      this.showSimulationNotice(`Delivered ${summarizeResources(transferred)} to ${this.getBuildingLabel(buildingIndex)}.`);
+    } else {
+      this.showSimulationNotice(`${this.getBuildingLabel(buildingIndex)} does not accept this worker's cargo.`);
+    }
+  }
+
+  private finishWorkerOrder(worker: SimulationWorker): void {
+    worker.orderAction = null;
+    worker.targetBuildingIndex = null;
+    worker.taskProgressSeconds = 0;
+    this.setWorkerTaskState(worker, 'idle');
+  }
+
+  private continueWorkerLoopAfterDelivery(worker: SimulationWorker): void {
+    const loop = worker.loop;
+    if (!loop || this.simulationReturnStarted) {
+      this.finishWorkerOrder(worker);
+      return;
+    }
+    if (worker.cargo.length >= WORKER_CARGO_CAPACITY) {
+      worker.loop = null;
+      this.showSimulationNotice('A worker loop stopped because rejected cargo filled every slot.');
+      this.finishWorkerOrder(worker);
+      return;
+    }
+    this.beginWorkerOrder(worker, loop.sourceBuildingIndex, 'gather', true);
+  }
+
+  private handleWorkerArrival(worker: SimulationWorker): void {
+    const action = worker.orderAction;
+    const buildingIndex = worker.targetBuildingIndex;
+    if (action === null || buildingIndex === null) {
+      this.finishWorkerOrder(worker);
+      return;
+    }
+
+    if (action === 'return-home') {
+      this.finishWorkerOrder(worker);
+      return;
+    }
+    if (action === 'deliver') {
+      this.setWorkerTaskState(worker, 'delivering');
+      this.completeWorkerDelivery(worker, buildingIndex);
+      return;
+    }
+
+    worker.taskProgressSeconds = 0;
+    this.setWorkerTaskState(worker, 'gathering');
   }
 
   private sendWorkersHome(currentMinute: number): void {
     this.simulationReturnStarted = true;
     const remainingRealSeconds =
       (SIMULATION_DAY_MINUTES - currentMinute) / SIMULATION_MINUTES_PER_REAL_SECOND;
+    let discardedResources = 0;
 
     this.simulationWorkers.forEach((worker) => {
-      this.routeWorkerToBuilding(worker, worker.homeBuildingIndex);
+      discardedResources += worker.cargo.length;
+      worker.cargo = [];
+      worker.loop = null;
+      worker.pendingLoopSourceBuildingIndex = null;
+      this.beginWorkerOrder(worker, worker.homeBuildingIndex, 'return-home');
       const remainingDistance = this.getWorkerRemainingRouteDistance(worker);
       worker.speed = remainingDistance > 0 ? remainingDistance / Math.max(0.01, remainingRealSeconds) : 0;
       this.setWorkerSelected(worker, false);
     });
+    this.updateSimulationWorkerPanel();
+    this.showSimulationNotice(
+      discardedResources > 0
+        ? `Workday ended. ${discardedResources} carried resource${discardedResources === 1 ? '' : 's'} discarded.`
+        : 'Workday ended. Workers are returning home.',
+    );
   }
 
   private getWorkerRemainingRouteDistance(worker: SimulationWorker): number {
@@ -2218,6 +2509,19 @@ export class SceneController {
 
   private updateSimulationWorkers(deltaSeconds: number): void {
     this.simulationWorkers.forEach((worker) => {
+      if (worker.taskState === 'gathering') {
+        this.updateWorkerGathering(worker, deltaSeconds);
+        return;
+      }
+      if (worker.taskState === 'producing-building') {
+        worker.taskProgressSeconds += deltaSeconds;
+        if (worker.taskProgressSeconds >= SIMULATION_BUILDING_WORK_SECONDS) {
+          this.continueWorkerLoopAfterDelivery(worker);
+        }
+        return;
+      }
+
+      const hadRoute = worker.routeNodeIds.length > 0;
       let remainingMovement = worker.speed * deltaSeconds;
       while (remainingMovement > 0 && worker.routeIndex < worker.routeNodeIds.length) {
         const targetNode = this.getPathNode(worker.routeNodeIds[worker.routeIndex]);
@@ -2247,8 +2551,67 @@ export class SceneController {
       if (worker.routeIndex >= worker.routeNodeIds.length) {
         worker.routeNodeIds = [];
         worker.routeIndex = 0;
+        if (hadRoute) {
+          this.handleWorkerArrival(worker);
+        }
       }
     });
+    this.updateSimulationWorkerPanel();
+  }
+
+  private updateWorkerGathering(worker: SimulationWorker, deltaSeconds: number): void {
+    const buildingIndex = worker.targetBuildingIndex;
+    const prefab = buildingIndex === null ? null : this.placedPrefabs[buildingIndex];
+    if (buildingIndex === null || !prefab || !isResourceSource(prefab.key)) {
+      this.finishWorkerOrder(worker);
+      return;
+    }
+
+    worker.taskProgressSeconds += deltaSeconds;
+    while (
+      worker.taskProgressSeconds >= SIMULATION_GATHER_SECONDS &&
+      worker.cargo.length < WORKER_CARGO_CAPACITY
+    ) {
+      const destinationPrefab = worker.loop
+        ? this.placedPrefabs[worker.loop.destinationBuildingIndex] ?? null
+        : null;
+      const resource = getGatheredResource(
+        prefab.key,
+        destinationPrefab?.key ?? null,
+        worker.quarryFallback,
+      );
+      if (!resource) {
+        this.finishWorkerOrder(worker);
+        return;
+      }
+      if (prefab.key === 'fireworksFactory') {
+        const available = this.getBuildingResourceCount(buildingIndex, 'fireworks');
+        if (available <= 0) {
+          worker.taskProgressSeconds = 0;
+          return;
+        }
+        this.addBuildingResource(buildingIndex, 'fireworks', -1);
+      }
+
+      worker.cargo.push(resource);
+      worker.taskProgressSeconds -= SIMULATION_GATHER_SECONDS;
+      if (prefab.key === 'quarry' && !worker.loop) {
+        worker.quarryFallback = worker.quarryFallback === 'ore' ? 'stone' : 'ore';
+      }
+    }
+
+    if (worker.cargo.length < WORKER_CARGO_CAPACITY) {
+      return;
+    }
+
+    const loop = worker.loop;
+    if (loop) {
+      this.beginWorkerOrder(worker, loop.destinationBuildingIndex, 'deliver', true);
+    } else {
+      const gathered = summarizeResources(worker.cargo);
+      this.finishWorkerOrder(worker);
+      this.showSimulationNotice(`Worker load full: ${gathered}. Select a destination.`);
+    }
   }
 
   private updateSimulationHud(): void {
@@ -2294,6 +2657,60 @@ export class SceneController {
     worker.selected = selected;
     worker.mesh.material.emissive.setHex(selected ? 0xf4d17a : 0x000000);
     worker.mesh.material.emissiveIntensity = selected ? 0.65 : 0;
+    this.updateSimulationWorkerPanel();
+  }
+
+  private updateSimulationWorkerPanel(): void {
+    const panel = document.querySelector<HTMLElement>('.simulation-worker-panel');
+    const summary = document.querySelector<HTMLElement>('.simulation-worker-panel__summary');
+    const detail = document.querySelector<HTMLElement>('.simulation-worker-panel__detail');
+    if (!panel || !summary || !detail) {
+      return;
+    }
+
+    const selectedWorkers = this.simulationWorkers.filter((worker) => worker.selected);
+    panel.dataset.selectedCount = String(selectedWorkers.length);
+    if (selectedWorkers.length === 0) {
+      summary.textContent = `${this.simulationWorkers.length} workers · none selected`;
+      detail.textContent = this.simulationReturnStarted
+        ? 'Returning home'
+        : 'Click a worker or drag a box to select';
+      return;
+    }
+
+    const stateCounts = new Map<WorkerTaskState, number>();
+    const cargo = selectedWorkers.flatMap((worker) => worker.cargo);
+    selectedWorkers.forEach((worker) => {
+      stateCounts.set(worker.taskState, (stateCounts.get(worker.taskState) ?? 0) + 1);
+    });
+    const states = [...stateCounts.entries()]
+      .map(([state, count]) => `${count} ${state.replace('-', ' ')}`)
+      .join(' · ');
+    const pendingLoop = selectedWorkers.some((worker) => worker.pendingLoopSourceBuildingIndex !== null);
+    const activeLoops = selectedWorkers.filter((worker) => worker.loop !== null).length;
+
+    summary.textContent = `${selectedWorkers.length} selected · cargo ${cargo.length}/${selectedWorkers.length * WORKER_CARGO_CAPACITY}`;
+    detail.textContent = pendingLoop
+      ? `${states} · choose Shift-loop destination`
+      : `${states} · ${summarizeResources(cargo)}${activeLoops > 0 ? ` · ${activeLoops} looping` : ''}`;
+  }
+
+  private showSimulationNotice(message: string): void {
+    const notice = document.querySelector<HTMLElement>('.simulation-notice');
+    if (!notice) {
+      return;
+    }
+    notice.textContent = message;
+    notice.removeAttribute('hidden');
+    this.simulationNoticeClearAt = performance.now() + 3200;
+  }
+
+  private updateSimulationNotice(now: number): void {
+    if (this.simulationNoticeClearAt === 0 || now < this.simulationNoticeClearAt) {
+      return;
+    }
+    this.simulationNoticeClearAt = 0;
+    document.querySelector<HTMLElement>('.simulation-notice')?.setAttribute('hidden', '');
   }
 
   public dispose(): void {
@@ -3616,7 +4033,23 @@ export class SceneController {
   }
 
   private handleSimulationPointerDown(event: PointerEvent): void {
-    if (!this.simulationRunning || this.simulationPaused || (event.pointerType === 'mouse' && event.button !== 0)) {
+    if (
+      !this.simulationRunning ||
+      this.simulationPaused ||
+      this.simulationReturnStarted ||
+      (event.pointerType === 'mouse' && event.button !== 0)
+    ) {
+      return;
+    }
+
+    const workerAtPointer = this.getWorkerAtPointer(event);
+    if (workerAtPointer) {
+      event.preventDefault();
+      if (event.shiftKey) {
+        this.setWorkerSelected(workerAtPointer, !workerAtPointer.selected);
+      } else {
+        this.simulationWorkers.forEach((worker) => this.setWorkerSelected(worker, worker === workerAtPointer));
+      }
       return;
     }
 
@@ -3624,10 +4057,11 @@ export class SceneController {
     const buildingIndex = selectedWorkers.length > 0 ? this.getPrefabIndexAtPointer(event) : null;
     if (buildingIndex !== null) {
       event.preventDefault();
-      selectedWorkers.forEach((worker) => {
-        this.routeWorkerToBuilding(worker, buildingIndex);
-        this.setWorkerSelected(worker, false);
-      });
+      if (event.shiftKey) {
+        this.issueShiftBuildingOrder(selectedWorkers, buildingIndex);
+      } else {
+        this.issueOneShotBuildingOrder(selectedWorkers, buildingIndex);
+      }
       return;
     }
 
@@ -3635,6 +4069,7 @@ export class SceneController {
     this.canvas.setPointerCapture(event.pointerId);
     this.simulationMarqueePointerId = event.pointerId;
     this.simulationMarqueeStart = new THREE.Vector2(event.clientX, event.clientY);
+    this.simulationMarqueeAdditive = event.shiftKey;
     this.updateSimulationMarquee(event);
   }
 
@@ -3652,6 +4087,10 @@ export class SceneController {
     const top = Math.min(this.simulationMarqueeStart.y, event.clientY);
     const width = Math.abs(event.clientX - this.simulationMarqueeStart.x);
     const height = Math.abs(event.clientY - this.simulationMarqueeStart.y);
+    if (Math.max(width, height) < SIMULATION_CLICK_DISTANCE) {
+      marquee.setAttribute('hidden', '');
+      return;
+    }
     marquee.style.left = `${left}px`;
     marquee.style.top = `${top}px`;
     marquee.style.width = `${width}px`;
@@ -3673,23 +4112,44 @@ export class SceneController {
     const right = Math.max(this.simulationMarqueeStart.x, event.clientX);
     const top = Math.min(this.simulationMarqueeStart.y, event.clientY);
     const bottom = Math.max(this.simulationMarqueeStart.y, event.clientY);
+    const isClick = Math.max(right - left, bottom - top) < SIMULATION_CLICK_DISTANCE;
     const canvasBounds = this.canvas.getBoundingClientRect();
     const projected = new THREE.Vector3();
 
-    this.simulationWorkers.forEach((worker) => {
-      worker.mesh.getWorldPosition(projected);
-      projected.project(this.camera);
-      const screenX = canvasBounds.left + ((projected.x + 1) / 2) * canvasBounds.width;
-      const screenY = canvasBounds.top + ((1 - projected.y) / 2) * canvasBounds.height;
-      this.setWorkerSelected(
-        worker,
-        screenX >= left && screenX <= right && screenY >= top && screenY <= bottom,
-      );
-    });
+    if (isClick) {
+      if (!this.simulationMarqueeAdditive) {
+        this.simulationWorkers.forEach((worker) => this.setWorkerSelected(worker, false));
+      }
+    } else {
+      this.simulationWorkers.forEach((worker) => {
+        worker.mesh.getWorldPosition(projected);
+        projected.project(this.camera);
+        const screenX = canvasBounds.left + ((projected.x + 1) / 2) * canvasBounds.width;
+        const screenY = canvasBounds.top + ((1 - projected.y) / 2) * canvasBounds.height;
+        const inside = screenX >= left && screenX <= right && screenY >= top && screenY <= bottom;
+        this.setWorkerSelected(
+          worker,
+          this.simulationMarqueeAdditive ? (inside ? !worker.selected : worker.selected) : inside,
+        );
+      });
+    }
 
     this.simulationMarqueePointerId = null;
     this.simulationMarqueeStart = null;
+    this.simulationMarqueeAdditive = false;
     document.querySelector<HTMLElement>('.selection-marquee')?.setAttribute('hidden', '');
+  }
+
+  private getWorkerAtPointer(event: PointerEvent): SimulationWorker | null {
+    const bounds = this.canvas.getBoundingClientRect();
+    this.pointer.set(
+      ((event.clientX - bounds.left) / bounds.width) * 2 - 1,
+      -((event.clientY - bounds.top) / bounds.height) * 2 + 1,
+    );
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const hits = this.raycaster.intersectObjects(this.simulationWorkers.map((worker) => worker.mesh), false);
+    const hitMesh = hits[0]?.object;
+    return this.simulationWorkers.find((worker) => worker.mesh === hitMesh) ?? null;
   }
 
   private getPrefabIndexAtPointer(event: PointerEvent): number | null {
@@ -4000,6 +4460,7 @@ export class SceneController {
     this.lastFrameTime = now;
     this.controls.update();
     this.updateSimulation(deltaSeconds * this.simulationSpeed);
+    this.updateSimulationNotice(now);
     this.updateWaterAnimation(now * 0.001);
     this.renderer.render(this.scene, this.camera);
   };
