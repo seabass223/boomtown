@@ -258,6 +258,7 @@ const SIMULATION_END_HOUR = 20;
 const SIMULATION_DAY_MINUTES = (SIMULATION_END_HOUR - SIMULATION_START_HOUR) * 60;
 const SIMULATION_RETURN_MINUTE = 11 * 60 + 50;
 const SIMULATION_MINUTES_PER_REAL_SECOND = 3;
+const SIMULATION_BASE_REALTIME_MULTIPLIER = 2;
 const SIMULATION_CLOCK_STEP_MINUTES = 10;
 const SIMULATION_WORKER_SPEED = 0.82;
 const SIMULATION_GATHER_SECONDS = 1.4;
@@ -514,6 +515,33 @@ function resolveVibe(settings: VibeSettings): VibePreset {
     rimColor: lerpHexColor(first.rimColor, second.rimColor, alpha).getHex(),
     exposure: THREE.MathUtils.lerp(first.exposure, second.exposure, alpha),
   };
+}
+
+function getVibeWaterPalette(vibe: VibePreset): {
+  deep: THREE.Color;
+  clear: THREE.Color;
+  light: THREE.Color;
+} {
+  const background = new THREE.Color(vibe.background);
+  const fog = new THREE.Color(vibe.fog);
+  const sky = new THREE.Color(vibe.hemiSky);
+  const shadow = new THREE.Color(vibe.hemiGround);
+  const sunlight = new THREE.Color(vibe.sunColor);
+
+  const deep = new THREE.Color(0x0b3650)
+    .lerp(shadow, 0.38)
+    .lerp(fog, 0.08)
+    .multiplyScalar(THREE.MathUtils.lerp(0.75, 0.58, vibe.waterMood));
+  const clear = new THREE.Color(0x3b939d)
+    .lerp(fog, 0.26)
+    .lerp(background, 0.08)
+    .lerp(sunlight, vibe.warmMidtones * 0.07);
+  const light = new THREE.Color(0xd6eee8)
+    .lerp(sky, 0.32)
+    .lerp(fog, 0.16)
+    .lerp(sunlight, 0.08 + vibe.warmMidtones * 0.08);
+
+  return { deep, clear, light };
 }
 
 function gradeMaterialColor(baseColor: THREE.Color, vibe: VibePreset, role: string): THREE.Color {
@@ -3415,7 +3443,10 @@ export class SceneController {
 
     const near = Math.min(this.waterSettings.fogStart, this.waterSettings.fogEnd - 1);
     const far = Math.max(this.waterSettings.fogEnd, near + 1);
-    const fogColor = new THREE.Color(vibe.fog).lerp(new THREE.Color(vibe.background), 0.28);
+    const fogColor = new THREE.Color(vibe.fog);
+    this.waterMaterial.uniforms.fogColor?.value.copy(fogColor);
+    this.waterMaterial.uniforms.fogNear.value = near;
+    this.waterMaterial.uniforms.fogFar.value = far;
 
     if (this.scene.fog instanceof THREE.Fog) {
       this.scene.fog.color.copy(fogColor);
@@ -3430,6 +3461,7 @@ export class SceneController {
   private applyVibe(): void {
     const vibe = this.getCurrentVibe();
     const background = new THREE.Color(vibe.background);
+    const waterPalette = getVibeWaterPalette(vibe);
     this.scene.background = background;
     this.updateOceanFog(vibe);
 
@@ -3460,6 +3492,14 @@ export class SceneController {
     );
 
     this.scene.traverse((object) => {
+      if (object.name === 'Shore water ripple') {
+        const rippleMaterial = (object as THREE.Line).material;
+        if (rippleMaterial instanceof THREE.LineBasicMaterial) {
+          rippleMaterial.color.copy(waterPalette.light);
+        }
+        return;
+      }
+
       const mesh = object as THREE.Mesh;
       if (!mesh.isMesh) {
         return;
@@ -3467,18 +3507,9 @@ export class SceneController {
       const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       materials.forEach((material) => {
         if (mesh.name === 'Procedural ocean water' && material instanceof THREE.ShaderMaterial) {
-          const deepColor = new THREE.Color(0x0d2c48)
-            .lerp(new THREE.Color(0x061727), vibe.waterMood * 0.58)
-            .lerp(new THREE.Color(vibe.background), vibe.blueShadowTint * 0.08);
-          const clearColor = new THREE.Color(0x4fa7a1)
-            .lerp(new THREE.Color(0x6bbcc1), 1 - vibe.waterMood * 0.25)
-            .lerp(new THREE.Color(0xffd18a), vibe.warmMidtones * 0.045);
-          const lightColor = new THREE.Color(0xd6eee8)
-            .lerp(new THREE.Color(vibe.background), vibe.blueShadowTint * 0.12)
-            .lerp(new THREE.Color(0xffdfaa), vibe.warmMidtones * 0.1);
-          material.uniforms.uDeepColor.value.copy(deepColor);
-          material.uniforms.uClearColor.value.copy(clearColor);
-          material.uniforms.uLightColor.value.copy(lightColor);
+          material.uniforms.uDeepColor.value.copy(waterPalette.deep);
+          material.uniforms.uClearColor.value.copy(waterPalette.clear);
+          material.uniforms.uLightColor.value.copy(waterPalette.light);
           material.uniforms.uClarity.value = this.waterSettings.clarity;
           material.uniforms.uChoppiness.value = this.waterSettings.choppiness;
           return;
@@ -4479,7 +4510,7 @@ export class SceneController {
     if (this.runState.clock.running && !this.runState.clock.paused) {
       const fixedStepResult = runFixedSimulationSteps(
         this.simulationAccumulatorSeconds,
-        deltaSeconds,
+        deltaSeconds * SIMULATION_BASE_REALTIME_MULTIPLIER,
         this.runState.clock.speed,
         (stepSeconds) => this.updateSimulation(stepSeconds),
       );
