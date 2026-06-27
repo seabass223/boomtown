@@ -1,6 +1,11 @@
 import type { PrefabBuildingKey } from '../scene/PrefabBuildings';
+import {
+  getAcceptedResources,
+  getSourceResources,
+  type ResourceType,
+} from './economy.ts';
 
-export type ResourceType = 'wood' | 'water' | 'ore' | 'stone' | 'fireworks';
+export type { ResourceType } from './economy.ts';
 
 export type WorkerTaskState =
   | 'idle'
@@ -27,13 +32,8 @@ export const RESOURCE_LABELS: Record<ResourceType, string> = {
   fireworks: 'fireworks',
 };
 
-const BUILDING_ACCEPTS: Partial<Record<PrefabBuildingKey, readonly ResourceType[]>> = {
-  fireworksFactory: ['wood', 'water', 'ore'],
-  launchPad: ['wood', 'stone', 'fireworks'],
-};
-
 export function isResourceSource(key: PrefabBuildingKey): boolean {
-  return key === 'lumberMill' || key === 'waterTower' || key === 'quarry' || key === 'fireworksFactory';
+  return getSourceResources(key).length > 0;
 }
 
 export function getGatheredResource(
@@ -61,10 +61,6 @@ export function getGatheredResource(
   }
 }
 
-export function getAcceptedResources(key: PrefabBuildingKey): readonly ResourceType[] {
-  return BUILDING_ACCEPTS[key] ?? [];
-}
-
 export function acceptsAnyCargo(key: PrefabBuildingKey, cargo: readonly ResourceType[]): boolean {
   const accepted = getAcceptedResources(key);
   return cargo.some((resource) => accepted.includes(resource));
@@ -73,25 +69,6 @@ export function acceptsAnyCargo(key: PrefabBuildingKey, cargo: readonly Resource
 export function canCreateLoop(sourceKey: PrefabBuildingKey, destinationKey: PrefabBuildingKey): boolean {
   const gatheredResource = getGatheredResource(sourceKey, destinationKey, 'ore');
   return gatheredResource !== null && getAcceptedResources(destinationKey).includes(gatheredResource);
-}
-
-export function transferAcceptedCargo(
-  cargo: readonly ResourceType[],
-  destinationKey: PrefabBuildingKey,
-): { remaining: ResourceType[]; transferred: ResourceType[] } {
-  const accepted = getAcceptedResources(destinationKey);
-  const remaining: ResourceType[] = [];
-  const transferred: ResourceType[] = [];
-
-  cargo.forEach((resource) => {
-    if (accepted.includes(resource)) {
-      transferred.push(resource);
-    } else {
-      remaining.push(resource);
-    }
-  });
-
-  return { remaining, transferred };
 }
 
 export function summarizeResources(resources: readonly ResourceType[]): string {

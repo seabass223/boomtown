@@ -28,12 +28,28 @@ import {
   getGatheredResource,
   isResourceSource,
   summarizeResources,
-  transferAcceptedCargo,
-  type ResourceType,
-  type WorkerLoop,
   type WorkerOrderAction,
   type WorkerTaskState,
 } from '../simulation/workerLogistics';
+import {
+  addResource,
+  getAcceptedResources,
+  inventoryToResourceList,
+  removeResource,
+  resourceListToInventory,
+  transferAcceptedResources,
+  type ResourceType,
+} from '../simulation/economy.ts';
+import { runFixedSimulationSteps } from '../simulation/fixedStep.ts';
+import {
+  createBoomtownRunState,
+  createWorkerRunState,
+  getBuildingInventory as getRunBuildingInventory,
+  initializeRunBuildings,
+  resetBoomtownRunState,
+  type BoomtownRunState,
+  type WorkerRunState,
+} from '../simulation/runState.ts';
 
 type RockVariantType = 'block' | 'wide' | 'trapezoid' | 'narrow';
 
@@ -214,6 +230,7 @@ type WalkwayPathGraph = {
 
 type SimulationWorker = {
   mesh: THREE.Mesh<THREE.BoxGeometry, THREE.MeshStandardMaterial>;
+  state: WorkerRunState;
   baseColor: number;
   homeBuildingIndex: number;
   currentNodeId: string;
@@ -221,14 +238,6 @@ type SimulationWorker = {
   routeIndex: number;
   selected: boolean;
   speed: number;
-  cargo: ResourceType[];
-  taskState: WorkerTaskState;
-  orderAction: WorkerOrderAction | null;
-  targetBuildingIndex: number | null;
-  taskProgressSeconds: number;
-  loop: WorkerLoop | null;
-  pendingLoopSourceBuildingIndex: number | null;
-  quarryFallback: 'ore' | 'stone';
 };
 
 type GrassTexturePathOverlay = {
@@ -1912,14 +1921,8 @@ export class SceneController {
   private prefabPreviewWorldPosition: THREE.Vector2 | null = null;
   private interactionMode: SceneInteractionMode = 'pan';
   private readonly simulationWorkers: SimulationWorker[] = [];
-  private readonly simulationBuildingInventories = new Map<number, Map<ResourceType, number>>();
-  private simulationDay = 1;
-  private simulationElapsedRealSeconds = 0;
-  private simulationClockMinutes = 0;
-  private simulationRunning = false;
-  private simulationPaused = false;
-  private simulationReturnStarted = false;
-  private simulationSpeed: 1 | 2 | 4 | 8 = 1;
+  private runState: BoomtownRunState = createBoomtownRunState();
+  private simulationAccumulatorSeconds = 0;
   private simulationMarqueePointerId: number | null = null;
   private simulationMarqueeStart: THREE.Vector2 | null = null;
   private simulationMarqueeAdditive = false;
@@ -2003,24 +2006,25 @@ export class SceneController {
   }
 
   public continueSimulation(): void {
-    if (!this.simulationRunning || this.simulationDay >= SIMULATION_FINAL_DAY) {
+    if (!this.runState.clock.running || this.runState.clock.day >= SIMULATION_FINAL_DAY) {
       return;
     }
 
-    this.simulationDay += 1;
-    this.simulationElapsedRealSeconds = 0;
-    this.simulationClockMinutes = 0;
-    this.simulationReturnStarted = false;
-    this.simulationPaused = false;
+    this.runState.clock.day += 1;
+    this.runState.clock.elapsedSimulationSeconds = 0;
+    this.runState.clock.clockMinutes = 0;
+    this.runState.clock.returnStarted = false;
+    this.runState.clock.paused = false;
+    this.simulationAccumulatorSeconds = 0;
     this.clearSimulationWorkers();
     this.spawnSimulationWorkers();
     this.updateSimulationHud();
-    this.showSimulationNotice(`July ${this.simulationDay}: assign fresh duties for the new workday.`);
+    this.showSimulationNotice(`July ${this.runState.clock.day}: assign fresh duties for the new workday.`);
   }
 
   public cycleSimulationSpeed(): void {
-    this.simulationSpeed =
-      this.simulationSpeed === 1 ? 2 : this.simulationSpeed === 2 ? 4 : this.simulationSpeed === 4 ? 8 : 1;
+    const speed = this.runState.clock.speed;
+    this.runState.clock.speed = speed === 1 ? 2 : speed === 2 ? 4 : speed === 4 ? 8 : 1;
     this.updateSimulationSpeedButton();
   }
 
@@ -2037,13 +2041,9 @@ export class SceneController {
 
     this.prefabUi.placeMode = false;
     this.prefabUi.editMode = false;
-    this.simulationDay = 1;
-    this.simulationElapsedRealSeconds = 0;
-    this.simulationClockMinutes = 0;
-    this.simulationReturnStarted = false;
-    this.simulationPaused = false;
-    this.simulationSpeed = 1;
-    this.simulationRunning = true;
+    this.runState = resetBoomtownRunState();
+    this.runState.clock.running = true;
+    this.simulationAccumulatorSeconds = 0;
     this.initializeSimulationBuildingInventories();
     this.lastFrameTime = performance.now();
     this.spawnSimulationWorkers();
@@ -2057,13 +2057,14 @@ export class SceneController {
   }
 
   private stopSimulation(): void {
-    this.simulationRunning = false;
-    this.simulationPaused = false;
+    this.runState.clock.running = false;
+    this.runState.clock.paused = false;
+    this.simulationAccumulatorSeconds = 0;
     this.simulationMarqueePointerId = null;
     this.simulationMarqueeStart = null;
     this.simulationMarqueeAdditive = false;
     this.clearSimulationWorkers();
-    this.simulationBuildingInventories.clear();
+    this.runState.buildings.clear();
     document.querySelector<HTMLElement>('.simulation-hud')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.simulation-worker-panel')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.simulation-notice')?.setAttribute('hidden', '');
@@ -2072,10 +2073,7 @@ export class SceneController {
   }
 
   private initializeSimulationBuildingInventories(): void {
-    this.simulationBuildingInventories.clear();
-    this.placedPrefabs.forEach((_prefab, buildingIndex) => {
-      this.simulationBuildingInventories.set(buildingIndex, new Map());
-    });
+    initializeRunBuildings(this.runState, this.placedPrefabs.length);
   }
 
   private spawnSimulationWorkers(): void {
@@ -2102,6 +2100,7 @@ export class SceneController {
 
       for (let workerIndex = 0; workerIndex < 2; workerIndex += 1) {
         const baseColor = workerIndex === 0 ? 0x3f78a8 : 0xb9584d;
+        const workerState = createWorkerRunState(`house-${buildingIndex}-worker-${workerIndex}`);
         const material = new THREE.MeshStandardMaterial({
           color: baseColor,
           roughness: 0.78,
@@ -2116,8 +2115,10 @@ export class SceneController {
         mesh.castShadow = true;
         mesh.name = `Worker from house ${buildingIndex + 1}`;
         this.simulationLayer.add(mesh);
+        this.runState.workers.push(workerState);
         this.simulationWorkers.push({
           mesh,
+          state: workerState,
           baseColor,
           homeBuildingIndex: buildingIndex,
           currentNodeId: homeNode.id,
@@ -2125,14 +2126,6 @@ export class SceneController {
           routeIndex: 0,
           selected: false,
           speed: SIMULATION_WORKER_SPEED,
-          cargo: [],
-          taskState: 'idle',
-          orderAction: null,
-          targetBuildingIndex: null,
-          taskProgressSeconds: 0,
-          loop: null,
-          pendingLoopSourceBuildingIndex: null,
-          quarryFallback: 'ore',
         });
       }
     });
@@ -2146,6 +2139,7 @@ export class SceneController {
       worker.mesh.material.dispose();
     });
     this.simulationWorkers.length = 0;
+    this.runState.workers.length = 0;
     this.updateSimulationWorkerPanel();
   }
 
@@ -2227,7 +2221,7 @@ export class SceneController {
   }
 
   private setWorkerTaskState(worker: SimulationWorker, state: WorkerTaskState): void {
-    worker.taskState = state;
+    worker.state.taskState = state;
     const stateColor = WORKER_STATE_COLORS[state];
     worker.mesh.material.color.setHex(state === 'idle' ? worker.baseColor : stateColor);
     this.updateSimulationWorkerPanel();
@@ -2240,19 +2234,19 @@ export class SceneController {
     preserveLoop = false,
   ): boolean {
     if (!preserveLoop) {
-      worker.loop = null;
-      worker.pendingLoopSourceBuildingIndex = null;
+      worker.state.loop = null;
+      worker.state.pendingLoopSourceBuildingIndex = null;
     }
     if (!this.routeWorkerToBuilding(worker, buildingIndex)) {
-      worker.orderAction = null;
-      worker.targetBuildingIndex = null;
+      worker.state.orderAction = null;
+      worker.state.targetBuildingIndex = null;
       this.setWorkerTaskState(worker, 'idle');
       return false;
     }
 
-    worker.orderAction = action;
-    worker.targetBuildingIndex = buildingIndex;
-    worker.taskProgressSeconds = 0;
+    worker.state.orderAction = action;
+    worker.state.targetBuildingIndex = buildingIndex;
+    worker.state.taskProgressSeconds = 0;
     this.setWorkerTaskState(
       worker,
       action === 'return-home' ? 'returning-home' : action === 'deliver' ? 'delivering' : 'traveling',
@@ -2265,30 +2259,37 @@ export class SceneController {
     return prefab ? getPrefabDefinition(prefab.key).label : 'building';
   }
 
-  private getBuildingInventory(buildingIndex: number): Map<ResourceType, number> {
-    let inventory = this.simulationBuildingInventories.get(buildingIndex);
-    if (!inventory) {
-      inventory = new Map();
-      this.simulationBuildingInventories.set(buildingIndex, inventory);
+  private getBuildingResourceCount(
+    buildingIndex: number,
+    resource: ResourceType,
+    inventoryKind: 'input' | 'output' = 'input',
+  ): number {
+    return getRunBuildingInventory(this.runState, buildingIndex, inventoryKind)[resource];
+  }
+
+  private addBuildingResource(
+    buildingIndex: number,
+    resource: ResourceType,
+    amount: number,
+    inventoryKind: 'input' | 'output' = 'input',
+  ): void {
+    const inventory = getRunBuildingInventory(this.runState, buildingIndex, inventoryKind);
+    if (amount >= 0) {
+      addResource(inventory, resource, amount);
+    } else {
+      removeResource(inventory, resource, -amount);
     }
-    return inventory;
-  }
-
-  private getBuildingResourceCount(buildingIndex: number, resource: ResourceType): number {
-    return this.getBuildingInventory(buildingIndex).get(resource) ?? 0;
-  }
-
-  private addBuildingResource(buildingIndex: number, resource: ResourceType, amount: number): void {
-    const inventory = this.getBuildingInventory(buildingIndex);
-    inventory.set(resource, Math.max(0, (inventory.get(resource) ?? 0) + amount));
   }
 
   private canGatherAtBuilding(worker: SimulationWorker, buildingIndex: number): boolean {
     const prefab = this.placedPrefabs[buildingIndex];
-    if (!prefab || !isResourceSource(prefab.key) || worker.cargo.length >= WORKER_CARGO_CAPACITY) {
+    if (!prefab || !isResourceSource(prefab.key) || worker.state.cargo.length >= WORKER_CARGO_CAPACITY) {
       return false;
     }
-    return prefab.key !== 'fireworksFactory' || this.getBuildingResourceCount(buildingIndex, 'fireworks') > 0;
+    return (
+      prefab.key !== 'fireworksFactory' ||
+      this.getBuildingResourceCount(buildingIndex, 'fireworks', 'output') > 0
+    );
   }
 
   private issueOneShotWorkerOrder(worker: SimulationWorker, buildingIndex: number): 'gather' | 'deliver' | 'invalid' {
@@ -2297,7 +2298,7 @@ export class SceneController {
       return 'invalid';
     }
 
-    if (acceptsAnyCargo(prefab.key, worker.cargo)) {
+    if (acceptsAnyCargo(prefab.key, worker.state.cargo)) {
       return this.beginWorkerOrder(worker, buildingIndex, 'deliver') ? 'deliver' : 'invalid';
     }
     if (this.canGatherAtBuilding(worker, buildingIndex)) {
@@ -2331,15 +2332,17 @@ export class SceneController {
       return;
     }
 
-    const awaitingDestination = workers.some((worker) => worker.pendingLoopSourceBuildingIndex !== null);
+    const awaitingDestination = workers.some(
+      (worker) => worker.state.pendingLoopSourceBuildingIndex !== null,
+    );
     if (!awaitingDestination) {
       if (!isResourceSource(clickedPrefab.key)) {
         this.showSimulationNotice('Shift-loop step 1 must be a resource source.');
         return;
       }
       workers.forEach((worker) => {
-        worker.pendingLoopSourceBuildingIndex = buildingIndex;
-        worker.loop = null;
+        worker.state.pendingLoopSourceBuildingIndex = buildingIndex;
+        worker.state.loop = null;
       });
       this.updateSimulationWorkerPanel();
       this.showSimulationNotice(`Loop source set to ${this.getBuildingLabel(buildingIndex)}. Shift-click a destination.`);
@@ -2348,9 +2351,9 @@ export class SceneController {
 
     let created = 0;
     workers.forEach((worker) => {
-      const sourceBuildingIndex = worker.pendingLoopSourceBuildingIndex;
+      const sourceBuildingIndex = worker.state.pendingLoopSourceBuildingIndex;
       const sourcePrefab = sourceBuildingIndex === null ? null : this.placedPrefabs[sourceBuildingIndex];
-      worker.pendingLoopSourceBuildingIndex = null;
+      worker.state.pendingLoopSourceBuildingIndex = null;
       if (
         sourceBuildingIndex === null ||
         !sourcePrefab ||
@@ -2359,11 +2362,11 @@ export class SceneController {
         return;
       }
 
-      worker.loop = { sourceBuildingIndex, destinationBuildingIndex: buildingIndex };
+      worker.state.loop = { sourceBuildingIndex, destinationBuildingIndex: buildingIndex };
       if (this.beginWorkerOrder(worker, sourceBuildingIndex, 'gather', true)) {
         created += 1;
       } else {
-        worker.loop = null;
+        worker.state.loop = null;
       }
     });
 
@@ -2384,10 +2387,21 @@ export class SceneController {
       return;
     }
 
-    const { remaining, transferred } = transferAcceptedCargo(worker.cargo, prefab.key);
-    worker.cargo = remaining;
-    transferred.forEach((resource) => this.addBuildingResource(buildingIndex, resource, 1));
-    worker.taskProgressSeconds = 0;
+    const cargoInventory = resourceListToInventory(worker.state.cargo);
+    const transferredAmounts = transferAcceptedResources(
+      cargoInventory,
+      getRunBuildingInventory(this.runState, buildingIndex, 'input'),
+      getAcceptedResources(prefab.key),
+    );
+    const transferred = inventoryToResourceList({
+      wood: transferredAmounts.wood ?? 0,
+      water: transferredAmounts.water ?? 0,
+      ore: transferredAmounts.ore ?? 0,
+      stone: transferredAmounts.stone ?? 0,
+      fireworks: transferredAmounts.fireworks ?? 0,
+    });
+    worker.state.cargo = inventoryToResourceList(cargoInventory);
+    worker.state.taskProgressSeconds = 0;
     this.setWorkerTaskState(worker, 'producing-building');
 
     if (transferred.length > 0) {
@@ -2398,20 +2412,20 @@ export class SceneController {
   }
 
   private finishWorkerOrder(worker: SimulationWorker): void {
-    worker.orderAction = null;
-    worker.targetBuildingIndex = null;
-    worker.taskProgressSeconds = 0;
+    worker.state.orderAction = null;
+    worker.state.targetBuildingIndex = null;
+    worker.state.taskProgressSeconds = 0;
     this.setWorkerTaskState(worker, 'idle');
   }
 
   private continueWorkerLoopAfterDelivery(worker: SimulationWorker): void {
-    const loop = worker.loop;
-    if (!loop || this.simulationReturnStarted) {
+    const loop = worker.state.loop;
+    if (!loop || this.runState.clock.returnStarted) {
       this.finishWorkerOrder(worker);
       return;
     }
-    if (worker.cargo.length >= WORKER_CARGO_CAPACITY) {
-      worker.loop = null;
+    if (worker.state.cargo.length >= WORKER_CARGO_CAPACITY) {
+      worker.state.loop = null;
       this.showSimulationNotice('A worker loop stopped because rejected cargo filled every slot.');
       this.finishWorkerOrder(worker);
       return;
@@ -2420,8 +2434,8 @@ export class SceneController {
   }
 
   private handleWorkerArrival(worker: SimulationWorker): void {
-    const action = worker.orderAction;
-    const buildingIndex = worker.targetBuildingIndex;
+    const action = worker.state.orderAction;
+    const buildingIndex = worker.state.targetBuildingIndex;
     if (action === null || buildingIndex === null) {
       this.finishWorkerOrder(worker);
       return;
@@ -2437,21 +2451,21 @@ export class SceneController {
       return;
     }
 
-    worker.taskProgressSeconds = 0;
+    worker.state.taskProgressSeconds = 0;
     this.setWorkerTaskState(worker, 'gathering');
   }
 
   private sendWorkersHome(currentMinute: number): void {
-    this.simulationReturnStarted = true;
+    this.runState.clock.returnStarted = true;
     const remainingRealSeconds =
       (SIMULATION_DAY_MINUTES - currentMinute) / SIMULATION_MINUTES_PER_REAL_SECOND;
     let discardedResources = 0;
 
     this.simulationWorkers.forEach((worker) => {
-      discardedResources += worker.cargo.length;
-      worker.cargo = [];
-      worker.loop = null;
-      worker.pendingLoopSourceBuildingIndex = null;
+      discardedResources += worker.state.cargo.length;
+      worker.state.cargo = [];
+      worker.state.loop = null;
+      worker.state.pendingLoopSourceBuildingIndex = null;
       this.beginWorkerOrder(worker, worker.homeBuildingIndex, 'return-home');
       const remainingDistance = this.getWorkerRemainingRouteDistance(worker);
       worker.speed = remainingDistance > 0 ? remainingDistance / Math.max(0.01, remainingRealSeconds) : 0;
@@ -2481,27 +2495,28 @@ export class SceneController {
   }
 
   private updateSimulation(deltaSeconds: number): void {
-    if (!this.simulationRunning || this.simulationPaused) {
+    if (!this.runState.clock.running || this.runState.clock.paused) {
       return;
     }
 
-    this.simulationElapsedRealSeconds += deltaSeconds;
-    const exactMinutes = this.simulationElapsedRealSeconds * SIMULATION_MINUTES_PER_REAL_SECOND;
+    this.runState.clock.elapsedSimulationSeconds += deltaSeconds;
+    const exactMinutes =
+      this.runState.clock.elapsedSimulationSeconds * SIMULATION_MINUTES_PER_REAL_SECOND;
     const steppedMinutes =
       Math.floor(exactMinutes / SIMULATION_CLOCK_STEP_MINUTES) * SIMULATION_CLOCK_STEP_MINUTES;
     const nextClockMinutes = Math.min(SIMULATION_DAY_MINUTES, steppedMinutes);
-    if (nextClockMinutes !== this.simulationClockMinutes) {
-      this.simulationClockMinutes = nextClockMinutes;
+    if (nextClockMinutes !== this.runState.clock.clockMinutes) {
+      this.runState.clock.clockMinutes = nextClockMinutes;
       this.updateSimulationHud();
     }
 
-    if (!this.simulationReturnStarted && exactMinutes >= SIMULATION_RETURN_MINUTE) {
+    if (!this.runState.clock.returnStarted && exactMinutes >= SIMULATION_RETURN_MINUTE) {
       this.sendWorkersHome(exactMinutes);
     }
 
     this.updateSimulationWorkers(deltaSeconds);
     if (exactMinutes >= SIMULATION_DAY_MINUTES) {
-      this.simulationClockMinutes = SIMULATION_DAY_MINUTES;
+      this.runState.clock.clockMinutes = SIMULATION_DAY_MINUTES;
       this.updateSimulationHud();
       this.finishSimulationDay();
     }
@@ -2509,13 +2524,13 @@ export class SceneController {
 
   private updateSimulationWorkers(deltaSeconds: number): void {
     this.simulationWorkers.forEach((worker) => {
-      if (worker.taskState === 'gathering') {
+      if (worker.state.taskState === 'gathering') {
         this.updateWorkerGathering(worker, deltaSeconds);
         return;
       }
-      if (worker.taskState === 'producing-building') {
-        worker.taskProgressSeconds += deltaSeconds;
-        if (worker.taskProgressSeconds >= SIMULATION_BUILDING_WORK_SECONDS) {
+      if (worker.state.taskState === 'producing-building') {
+        worker.state.taskProgressSeconds += deltaSeconds;
+        if (worker.state.taskProgressSeconds >= SIMULATION_BUILDING_WORK_SECONDS) {
           this.continueWorkerLoopAfterDelivery(worker);
         }
         return;
@@ -2560,55 +2575,55 @@ export class SceneController {
   }
 
   private updateWorkerGathering(worker: SimulationWorker, deltaSeconds: number): void {
-    const buildingIndex = worker.targetBuildingIndex;
+    const buildingIndex = worker.state.targetBuildingIndex;
     const prefab = buildingIndex === null ? null : this.placedPrefabs[buildingIndex];
     if (buildingIndex === null || !prefab || !isResourceSource(prefab.key)) {
       this.finishWorkerOrder(worker);
       return;
     }
 
-    worker.taskProgressSeconds += deltaSeconds;
+    worker.state.taskProgressSeconds += deltaSeconds;
     while (
-      worker.taskProgressSeconds >= SIMULATION_GATHER_SECONDS &&
-      worker.cargo.length < WORKER_CARGO_CAPACITY
+      worker.state.taskProgressSeconds >= SIMULATION_GATHER_SECONDS &&
+      worker.state.cargo.length < WORKER_CARGO_CAPACITY
     ) {
-      const destinationPrefab = worker.loop
-        ? this.placedPrefabs[worker.loop.destinationBuildingIndex] ?? null
+      const destinationPrefab = worker.state.loop
+        ? this.placedPrefabs[worker.state.loop.destinationBuildingIndex] ?? null
         : null;
       const resource = getGatheredResource(
         prefab.key,
         destinationPrefab?.key ?? null,
-        worker.quarryFallback,
+        worker.state.quarryFallback,
       );
       if (!resource) {
         this.finishWorkerOrder(worker);
         return;
       }
       if (prefab.key === 'fireworksFactory') {
-        const available = this.getBuildingResourceCount(buildingIndex, 'fireworks');
+        const available = this.getBuildingResourceCount(buildingIndex, 'fireworks', 'output');
         if (available <= 0) {
-          worker.taskProgressSeconds = 0;
+          worker.state.taskProgressSeconds = 0;
           return;
         }
-        this.addBuildingResource(buildingIndex, 'fireworks', -1);
+        this.addBuildingResource(buildingIndex, 'fireworks', -1, 'output');
       }
 
-      worker.cargo.push(resource);
-      worker.taskProgressSeconds -= SIMULATION_GATHER_SECONDS;
-      if (prefab.key === 'quarry' && !worker.loop) {
-        worker.quarryFallback = worker.quarryFallback === 'ore' ? 'stone' : 'ore';
+      worker.state.cargo.push(resource);
+      worker.state.taskProgressSeconds -= SIMULATION_GATHER_SECONDS;
+      if (prefab.key === 'quarry' && !worker.state.loop) {
+        worker.state.quarryFallback = worker.state.quarryFallback === 'ore' ? 'stone' : 'ore';
       }
     }
 
-    if (worker.cargo.length < WORKER_CARGO_CAPACITY) {
+    if (worker.state.cargo.length < WORKER_CARGO_CAPACITY) {
       return;
     }
 
-    const loop = worker.loop;
+    const loop = worker.state.loop;
     if (loop) {
       this.beginWorkerOrder(worker, loop.destinationBuildingIndex, 'deliver', true);
     } else {
-      const gathered = summarizeResources(worker.cargo);
+      const gathered = summarizeResources(worker.state.cargo);
       this.finishWorkerOrder(worker);
       this.showSimulationNotice(`Worker load full: ${gathered}. Select a destination.`);
     }
@@ -2618,16 +2633,16 @@ export class SceneController {
     const date = document.querySelector<HTMLElement>('.simulation-hud__date');
     const clock = document.querySelector<HTMLTimeElement>('.simulation-hud__clock');
     if (date) {
-      date.textContent = `July ${this.simulationDay}`;
+      date.textContent = `July ${this.runState.clock.day}`;
     }
     if (clock) {
-      const totalMinutes = SIMULATION_START_HOUR * 60 + this.simulationClockMinutes;
+      const totalMinutes = SIMULATION_START_HOUR * 60 + this.runState.clock.clockMinutes;
       const hour24 = Math.floor(totalMinutes / 60);
       const minutes = totalMinutes % 60;
       const hour12 = hour24 % 12 || 12;
       const suffix = hour24 >= 12 ? 'PM' : 'AM';
       clock.textContent = `${hour12}:${minutes.toString().padStart(2, '0')} ${suffix}`;
-      clock.dateTime = `2026-07-0${this.simulationDay}T${hour24.toString().padStart(2, '0')}:${minutes
+      clock.dateTime = `2026-07-0${this.runState.clock.day}T${hour24.toString().padStart(2, '0')}:${minutes
         .toString()
         .padStart(2, '0')}`;
     }
@@ -2636,18 +2651,18 @@ export class SceneController {
   private updateSimulationSpeedButton(): void {
     const button = document.querySelector<HTMLButtonElement>('.simulation-hud__speed');
     if (button) {
-      button.textContent = `${this.simulationSpeed}×`;
-      button.setAttribute('aria-label', `Simulation speed ${this.simulationSpeed}x`);
+      button.textContent = `${this.runState.clock.speed}×`;
+      button.setAttribute('aria-label', `Simulation speed ${this.runState.clock.speed}x`);
     }
   }
 
   private finishSimulationDay(): void {
-    this.simulationPaused = true;
+    this.runState.clock.paused = true;
     this.simulationWorkers.forEach((worker) => this.setWorkerSelected(worker, false));
     const modal = document.querySelector<HTMLElement>('.day-modal');
     const title = document.querySelector<HTMLElement>('#day-modal-title');
     if (title) {
-      title.textContent = this.simulationDay >= SIMULATION_FINAL_DAY ? 'Game Over' : "Today's progress";
+      title.textContent = this.runState.clock.day >= SIMULATION_FINAL_DAY ? 'Game Over' : "Today's progress";
     }
     modal?.removeAttribute('hidden');
     document.querySelector<HTMLButtonElement>('.day-modal__button')?.focus();
@@ -2672,22 +2687,24 @@ export class SceneController {
     panel.dataset.selectedCount = String(selectedWorkers.length);
     if (selectedWorkers.length === 0) {
       summary.textContent = `${this.simulationWorkers.length} workers · none selected`;
-      detail.textContent = this.simulationReturnStarted
+      detail.textContent = this.runState.clock.returnStarted
         ? 'Returning home'
         : 'Click a worker or drag a box to select';
       return;
     }
 
     const stateCounts = new Map<WorkerTaskState, number>();
-    const cargo = selectedWorkers.flatMap((worker) => worker.cargo);
+    const cargo = selectedWorkers.flatMap((worker) => worker.state.cargo);
     selectedWorkers.forEach((worker) => {
-      stateCounts.set(worker.taskState, (stateCounts.get(worker.taskState) ?? 0) + 1);
+      stateCounts.set(worker.state.taskState, (stateCounts.get(worker.state.taskState) ?? 0) + 1);
     });
     const states = [...stateCounts.entries()]
       .map(([state, count]) => `${count} ${state.replace('-', ' ')}`)
       .join(' · ');
-    const pendingLoop = selectedWorkers.some((worker) => worker.pendingLoopSourceBuildingIndex !== null);
-    const activeLoops = selectedWorkers.filter((worker) => worker.loop !== null).length;
+    const pendingLoop = selectedWorkers.some(
+      (worker) => worker.state.pendingLoopSourceBuildingIndex !== null,
+    );
+    const activeLoops = selectedWorkers.filter((worker) => worker.state.loop !== null).length;
 
     summary.textContent = `${selectedWorkers.length} selected · cargo ${cargo.length}/${selectedWorkers.length * WORKER_CARGO_CAPACITY}`;
     detail.textContent = pendingLoop
@@ -4034,9 +4051,9 @@ export class SceneController {
 
   private handleSimulationPointerDown(event: PointerEvent): void {
     if (
-      !this.simulationRunning ||
-      this.simulationPaused ||
-      this.simulationReturnStarted ||
+      !this.runState.clock.running ||
+      this.runState.clock.paused ||
+      this.runState.clock.returnStarted ||
       (event.pointerType === 'mouse' && event.button !== 0)
     ) {
       return;
@@ -4456,10 +4473,20 @@ export class SceneController {
   private readonly tick = (): void => {
     this.animationId = requestAnimationFrame(this.tick);
     const now = performance.now();
-    const deltaSeconds = Math.min(0.1, Math.max(0, (now - this.lastFrameTime) / 1000));
+    const deltaSeconds = Math.max(0, (now - this.lastFrameTime) / 1000);
     this.lastFrameTime = now;
     this.controls.update();
-    this.updateSimulation(deltaSeconds * this.simulationSpeed);
+    if (this.runState.clock.running && !this.runState.clock.paused) {
+      const fixedStepResult = runFixedSimulationSteps(
+        this.simulationAccumulatorSeconds,
+        deltaSeconds,
+        this.runState.clock.speed,
+        (stepSeconds) => this.updateSimulation(stepSeconds),
+      );
+      this.simulationAccumulatorSeconds = fixedStepResult.accumulatorSeconds;
+    } else {
+      this.simulationAccumulatorSeconds = 0;
+    }
     this.updateSimulationNotice(now);
     this.updateWaterAnimation(now * 0.001);
     this.renderer.render(this.scene, this.camera);
