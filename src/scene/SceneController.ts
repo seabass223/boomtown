@@ -2,8 +2,29 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GUI } from 'three/examples/jsm/libs/lil-gui.module.min.js';
 import type { NumberController } from 'three/examples/jsm/libs/lil-gui.module.min.js';
+import {
+  PREFAB_BUILDING_LABELS,
+  PREFAB_BUILDINGS,
+  type PrefabBuildingKey,
+  type PrefabGridPlacement,
+  type PrefabRotation,
+  createPrefabBuilding,
+  createPrefabPlacementPreview,
+  getPrefabCellCenter,
+  getPrefabCellKey,
+  getPrefabDefinition,
+  getPrefabDefinitionByLabel,
+  getPrefabFootprintCells,
+  getPrefabPlacementForWorldPoint,
+  getPrefabRotationFromDegrees,
+  getPrefabRotationRadians,
+  getPrefabWorldCenter,
+  getPrefabWorldFootprintCorners,
+} from './PrefabBuildings';
 
 type RockVariantType = 'block' | 'wide' | 'trapezoid' | 'narrow';
+
+export type SceneInteractionMode = 'pan' | 'island' | 'build' | 'edit' | 'path' | 'simulate';
 
 type IslandSettings = {
   rockSpacing: number;
@@ -51,6 +72,9 @@ type StoneSettings = {
 type WaterSettings = {
   clarity: number;
   choppiness: number;
+  edgeFog: boolean;
+  fogStart: number;
+  fogEnd: number;
 };
 
 type VibePresetName =
@@ -96,12 +120,17 @@ type IslandBuild = {
 };
 
 type ProceduralPreset = {
+  outlinePoints?: Array<[number, number]>;
   settings: IslandSettings;
   grassSettings: GrassTextureSettings;
   treeSettings: TreeSettings;
   stoneSettings: StoneSettings;
   waterSettings: WaterSettings;
   vibeSettings: VibeSettings;
+  cameraSettings?: CameraPresetSettings;
+  prefabSettings?: PrefabPresetSettings;
+  prefabPlacements?: PrefabPlacementPreset[];
+  walkwayPaths?: WalkwayPathGraph;
 };
 
 type PresetStore = {
@@ -118,12 +147,89 @@ type GuiOptionController = GuiDisplayController & {
   options: (options: string[]) => GuiOptionController;
 };
 
+type PlacedPrefab = {
+  key: PrefabBuildingKey;
+  group: THREE.Group;
+  cells: string[];
+  rotation: PrefabRotation;
+  placement: PrefabGridPlacement;
+};
+
+type PrefabPresetSettings = {
+  selected: string;
+  placeMode: boolean;
+  editMode: boolean;
+  rotationDegrees: number;
+};
+
+type PrefabPlacementPreset = {
+  key: PrefabBuildingKey;
+  originX: number;
+  originZ: number;
+  rotation: PrefabRotation;
+};
+
+type CameraPresetSettings = {
+  position: [number, number, number];
+  target: [number, number, number];
+  zoom: number;
+};
+
+type NaturalObjectCleanupResult = {
+  treesRemoved: number;
+  stonesRemoved: number;
+};
+
+type WalkwayPathKind = 'trunk' | 'branch';
+
+type WalkwayPathNode = {
+  id: string;
+  position: [number, number];
+  buildingIndex?: number;
+};
+
+type WalkwayPathSegment = {
+  from: string;
+  to: string;
+  kind: WalkwayPathKind;
+};
+
+type WalkwayPathGraph = {
+  nodes: WalkwayPathNode[];
+  segments: WalkwayPathSegment[];
+};
+
+type SimulationWorker = {
+  mesh: THREE.Mesh<THREE.BoxGeometry, THREE.MeshStandardMaterial>;
+  homeBuildingIndex: number;
+  currentNodeId: string;
+  routeNodeIds: string[];
+  routeIndex: number;
+  selected: boolean;
+  speed: number;
+};
+
+type GrassTexturePathOverlay = {
+  bounds: THREE.Box2;
+  graph: WalkwayPathGraph | null;
+};
+
 const MIN_DRAW_POINT_DISTANCE = 0.08;
 const MIN_FINISH_POINTS = 6;
 const TOP_LIFT = 0.015;
 const GRASS_TEXTURE_SIZE = 512;
 const PRESET_STORAGE_KEY = 'boomtown-island-procedural-presets';
 const EMPTY_PRESET_OPTION = 'No saved presets';
+const PREFAB_NATURAL_OBJECT_CLEARANCE = 0.06;
+const OCEAN_PLANE_SIZE = 160;
+const SIMULATION_START_HOUR = 8;
+const SIMULATION_END_HOUR = 20;
+const SIMULATION_DAY_MINUTES = (SIMULATION_END_HOUR - SIMULATION_START_HOUR) * 60;
+const SIMULATION_RETURN_MINUTE = 11 * 60 + 50;
+const SIMULATION_MINUTES_PER_REAL_SECOND = 3;
+const SIMULATION_CLOCK_STEP_MINUTES = 10;
+const SIMULATION_WORKER_SPEED = 0.82;
+const SIMULATION_FINAL_DAY = 4;
 const ROCK_GEOMETRIES = new Map<string, THREE.BufferGeometry>();
 const TREE_GEOMETRIES = new Map<string, THREE.BufferGeometry>();
 const VIBE_PRESET_NAMES: VibePresetName[] = [
@@ -531,17 +637,18 @@ function applyRockiness(points: THREE.Vector2[], amount: number, seed: number): 
   });
 }
 
-function createGrassTexture(settings: GrassTextureSettings): THREE.CanvasTexture {
+function createGrassTexture(settings: GrassTextureSettings, pathOverlay?: GrassTexturePathOverlay): THREE.CanvasTexture {
   const canvas = document.createElement('canvas');
   canvas.width = GRASS_TEXTURE_SIZE;
   canvas.height = GRASS_TEXTURE_SIZE;
   paintGrassTexture(canvas, settings);
+  paintWalkwayPathsIntoGrassTexture(canvas, pathOverlay, settings.seed);
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.wrapS = THREE.RepeatWrapping;
   texture.wrapT = THREE.RepeatWrapping;
-  texture.repeat.setScalar(settings.textureScale);
+  texture.repeat.setScalar(pathOverlay?.graph ? 1 : settings.textureScale);
   texture.magFilter = THREE.NearestFilter;
   texture.minFilter = THREE.LinearMipmapLinearFilter;
   texture.generateMipmaps = true;
@@ -625,6 +732,222 @@ function paintGrassTexture(canvas: HTMLCanvasElement, settings: GrassTextureSett
   }
 }
 
+function paintWalkwayPathsIntoGrassTexture(
+  canvas: HTMLCanvasElement,
+  overlay: GrassTexturePathOverlay | undefined,
+  seed: number,
+): void {
+  if (!overlay?.graph || overlay.graph.segments.length === 0) {
+    return;
+  }
+
+  const context = canvas.getContext('2d');
+  if (!context) {
+    return;
+  }
+
+  const { bounds, graph } = overlay;
+  const size = bounds.getSize(new THREE.Vector2());
+  if (size.x <= 0 || size.y <= 0) {
+    return;
+  }
+
+  const random = createSeededRandom(seed * 41 + graph.segments.length * 97);
+  const nodeById = new Map(graph.nodes.map((node) => [node.id, new THREE.Vector2(node.position[0], node.position[1])]));
+  const toCanvas = (point: THREE.Vector2): THREE.Vector2 =>
+    new THREE.Vector2(
+      THREE.MathUtils.mapLinear(point.x, bounds.min.x, bounds.max.x, 0, canvas.width),
+      THREE.MathUtils.mapLinear(point.y, bounds.min.y, bounds.max.y, canvas.height, 0),
+    );
+
+  context.save();
+  context.globalCompositeOperation = 'source-over';
+  context.lineCap = 'round';
+  context.lineJoin = 'round';
+
+  graph.segments.forEach((segment, segmentIndex) => {
+    const from = nodeById.get(segment.from);
+    const to = nodeById.get(segment.to);
+    if (!from || !to) {
+      return;
+    }
+
+    const start = toCanvas(from);
+    const end = toCanvas(to);
+    const delta = end.clone().sub(start);
+    const length = delta.length();
+    if (length < 2) {
+      return;
+    }
+
+    const direction = delta.clone().normalize();
+    const normal = new THREE.Vector2(-direction.y, direction.x);
+    const baseWidth = segment.kind === 'trunk' ? 34 : 24;
+    const steps = Math.max(3, Math.round(length / 34));
+    const pathPoints: THREE.Vector2[] = [];
+    for (let index = 0; index <= steps; index += 1) {
+      const t = index / steps;
+      const edgeFade = Math.sin(t * Math.PI);
+      const offset =
+        (Math.sin((segmentIndex + 1) * 1.73 + t * 8.1) * 0.54 +
+          Math.sin((segmentIndex + 3) * 0.92 + t * 16.7) * 0.28) *
+        baseWidth *
+        0.18 *
+        edgeFade;
+      pathPoints.push(start.clone().lerp(end, t).addScaledVector(normal, offset));
+    }
+
+    context.filter = 'blur(1.4px)';
+    for (let pass = 0; pass < 6; pass += 1) {
+      const widthJitter = THREE.MathUtils.lerp(0.95, 1.55, random());
+      context.strokeStyle = `hsla(${THREE.MathUtils.lerp(32, 39, random())}, ${THREE.MathUtils.lerp(
+        36,
+        48,
+        random(),
+      )}%, ${THREE.MathUtils.lerp(45, 55, random())}%, ${THREE.MathUtils.lerp(0.1, 0.2, random())})`;
+      context.lineWidth = baseWidth * widthJitter;
+      context.beginPath();
+      pathPoints.forEach((point, pointIndex) => {
+        const edgeNoise = normal.clone().multiplyScalar((random() - 0.5) * baseWidth * 0.22);
+        const noisy = point.clone().add(edgeNoise);
+        if (pointIndex === 0) {
+          context.moveTo(noisy.x, noisy.y);
+        } else {
+          context.lineTo(noisy.x, noisy.y);
+        }
+      });
+      context.stroke();
+    }
+
+    context.filter = 'blur(0.9px)';
+    const stainCount = Math.max(2, Math.round(length / 58));
+    for (let index = 0; index < stainCount; index += 1) {
+      const t = random();
+      const center = start
+        .clone()
+        .lerp(end, t)
+        .addScaledVector(normal, (random() - 0.5) * baseWidth * 0.48);
+      drawSoftOval(
+        context,
+        center.x,
+        center.y,
+        baseWidth * THREE.MathUtils.lerp(0.28, 0.74, random()),
+        baseWidth * THREE.MathUtils.lerp(0.1, 0.26, random()),
+        Math.atan2(delta.y, delta.x) + (random() - 0.5) * 1.1,
+        `hsla(${THREE.MathUtils.lerp(25, 34, random())}, ${THREE.MathUtils.lerp(
+          30,
+          44,
+          random(),
+        )}%, ${THREE.MathUtils.lerp(34, 43, random())}%, ${THREE.MathUtils.lerp(0.06, 0.14, random())})`,
+      );
+    }
+
+    const blobCount = Math.max(3, Math.round(length / 34));
+    for (let index = 0; index < blobCount; index += 1) {
+      const t = (index + random() * 0.82) / blobCount;
+      const center = start
+        .clone()
+        .lerp(end, t)
+        .addScaledVector(normal, (random() - 0.5) * baseWidth * 0.36);
+      const rotation = Math.atan2(delta.y, delta.x) + (random() - 0.5) * 0.95;
+      drawSoftOval(
+        context,
+        center.x,
+        center.y,
+        baseWidth * THREE.MathUtils.lerp(0.34, 0.78, random()),
+        baseWidth * THREE.MathUtils.lerp(0.13, 0.3, random()),
+        rotation,
+        `hsla(${THREE.MathUtils.lerp(33, 41, random())}, ${THREE.MathUtils.lerp(
+          38,
+          52,
+          random(),
+        )}%, ${THREE.MathUtils.lerp(48, 58, random())}%, ${THREE.MathUtils.lerp(0.12, 0.24, random())})`,
+      );
+      if (random() > 0.36) {
+        drawSoftOval(
+          context,
+          center.x + normal.x * (random() - 0.5) * baseWidth * 0.16,
+          center.y + normal.y * (random() - 0.5) * baseWidth * 0.16,
+          baseWidth * THREE.MathUtils.lerp(0.14, 0.34, random()),
+          baseWidth * THREE.MathUtils.lerp(0.05, 0.12, random()),
+          rotation + (random() - 0.5) * 0.8,
+          `hsla(${THREE.MathUtils.lerp(40, 48, random())}, ${THREE.MathUtils.lerp(
+            44,
+            58,
+            random(),
+          )}%, ${THREE.MathUtils.lerp(60, 70, random())}%, ${THREE.MathUtils.lerp(0.09, 0.2, random())})`,
+        );
+      }
+    }
+
+    context.filter = 'blur(0.65px)';
+    const dustySpotCount = Math.max(2, Math.round(length / 44));
+    for (let index = 0; index < dustySpotCount; index += 1) {
+      const t = random();
+      const center = start
+        .clone()
+        .lerp(end, t)
+        .addScaledVector(normal, (random() - 0.5) * baseWidth * 0.52);
+      drawSoftOval(
+        context,
+        center.x,
+        center.y,
+        baseWidth * THREE.MathUtils.lerp(0.13, 0.38, random()),
+        baseWidth * THREE.MathUtils.lerp(0.04, 0.12, random()),
+        Math.atan2(delta.y, delta.x) + (random() - 0.5) * 0.9,
+        `hsla(${THREE.MathUtils.lerp(42, 50, random())}, ${THREE.MathUtils.lerp(
+          42,
+          56,
+          random(),
+        )}%, ${THREE.MathUtils.lerp(64, 74, random())}%, ${THREE.MathUtils.lerp(0.08, 0.18, random())})`,
+      );
+    }
+
+    context.filter = 'blur(0.8px)';
+    const borderCount = Math.max(4, Math.round(length / 30));
+    for (let index = 0; index < borderCount; index += 1) {
+      const side = random() > 0.5 ? 1 : -1;
+      const t = random();
+      const center = start
+        .clone()
+        .lerp(end, t)
+        .addScaledVector(normal, side * baseWidth * THREE.MathUtils.lerp(0.46, 0.72, random()));
+      if (random() > 0.38) {
+        drawSoftOval(
+          context,
+          center.x,
+          center.y,
+          baseWidth * THREE.MathUtils.lerp(0.08, 0.28, random()),
+          baseWidth * THREE.MathUtils.lerp(0.04, 0.13, random()),
+          Math.atan2(delta.y, delta.x) + (random() - 0.5) * 1.4,
+          `hsla(${THREE.MathUtils.lerp(78, 104, random())}, ${THREE.MathUtils.lerp(
+            32,
+            48,
+            random(),
+          )}%, ${THREE.MathUtils.lerp(28, 42, random())}%, ${THREE.MathUtils.lerp(0.08, 0.2, random())})`,
+        );
+      } else {
+        drawSoftOval(
+          context,
+          center.x,
+          center.y,
+          baseWidth * THREE.MathUtils.lerp(0.12, 0.32, random()),
+          baseWidth * THREE.MathUtils.lerp(0.04, 0.12, random()),
+          random() * Math.PI,
+          `hsla(${THREE.MathUtils.lerp(26, 36, random())}, 32%, ${THREE.MathUtils.lerp(
+            30,
+            39,
+            random(),
+          )}%, ${THREE.MathUtils.lerp(0.04, 0.11, random())})`,
+        );
+      }
+    }
+  });
+
+  context.filter = 'none';
+  context.restore();
+}
+
 function drawSoftOval(
   context: CanvasRenderingContext2D,
   x: number,
@@ -645,21 +968,27 @@ function drawSoftOval(
 }
 
 function createLowPolyOceanMaterial(settings: WaterSettings): THREE.ShaderMaterial {
-  const uniforms = {
-    uTime: { value: 0 },
-    uClarity: { value: settings.clarity },
-    uChoppiness: { value: settings.choppiness },
-    uAmplitude: { value: THREE.MathUtils.lerp(0.04, 0.28, settings.choppiness) },
-    uFrequency: { value: THREE.MathUtils.lerp(0.22, 0.62, settings.choppiness) },
-    uSpeed: { value: THREE.MathUtils.lerp(0.55, 1.75, settings.choppiness) },
-    uDeepColor: { value: new THREE.Color(0x0d2c48) },
-    uClearColor: { value: new THREE.Color(0x4fa7a1) },
-    uLightColor: { value: new THREE.Color(0xd6eee8) },
-  };
+  const uniforms = THREE.UniformsUtils.merge([
+    THREE.UniformsLib.fog,
+    {
+      uTime: { value: 0 },
+      uClarity: { value: settings.clarity },
+      uChoppiness: { value: settings.choppiness },
+      uAmplitude: { value: THREE.MathUtils.lerp(0.12, 0.62, settings.choppiness) },
+      uFrequency: { value: THREE.MathUtils.lerp(0.22, 0.62, settings.choppiness) },
+      uSpeed: { value: THREE.MathUtils.lerp(0.55, 1.75, settings.choppiness) },
+      uDeepColor: { value: new THREE.Color(0x0d2c48) },
+      uClearColor: { value: new THREE.Color(0x4fa7a1) },
+      uLightColor: { value: new THREE.Color(0xd6eee8) },
+    },
+  ]);
 
   return new THREE.ShaderMaterial({
     uniforms,
+    fog: true,
     vertexShader: `
+      #include <fog_pars_vertex>
+
       uniform float uTime;
       uniform float uAmplitude;
       uniform float uFrequency;
@@ -674,13 +1003,17 @@ function createLowPolyOceanMaterial(settings: WaterSettings): THREE.ShaderMateri
         float cross = sin(uTime * uSpeed * 0.73 - displaced.x * uFrequency * 0.36 + displaced.y * uFrequency * 0.92);
         float small = sin(uTime * uSpeed * 1.41 + displaced.x * uFrequency * 1.8 + displaced.y * uFrequency * 0.28);
         float wave = rolling * 0.68 + cross * 0.22 + small * 0.1 * uChoppiness;
-        displaced.z += wave * uAmplitude;
+        displaced.y += wave * uAmplitude;
         vWave = wave * 0.5 + 0.5;
         vGrid = displaced.xy;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
+        vec4 mvPosition = modelViewMatrix * vec4(displaced, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        #include <fog_vertex>
       }
     `,
     fragmentShader: `
+      #include <fog_pars_fragment>
+
       uniform float uClarity;
       uniform float uChoppiness;
       uniform vec3 uDeepColor;
@@ -698,6 +1031,7 @@ function createLowPolyOceanMaterial(settings: WaterSettings): THREE.ShaderMateri
         vec3 color = base * (0.78 + facetedWave * 0.34 + gridShade - trough);
         color = mix(color, uLightColor, ridge);
         gl_FragColor = vec4(color, 1.0);
+        #include <fog_fragment>
       }
     `,
   });
@@ -783,6 +1117,128 @@ function distanceToOutline(point: THREE.Vector2, outlinePoints: THREE.Vector2[])
     nearest = Math.min(nearest, distanceToSegment(point, outlinePoints[i], outlinePoints[(i + 1) % outlinePoints.length]));
   }
   return nearest;
+}
+
+function isHiddenInstanceMatrix(matrix: THREE.Matrix4): boolean {
+  const elements = matrix.elements;
+  return elements[0] === 0 && elements[5] === 0 && elements[10] === 0;
+}
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  return target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName);
+}
+
+function createOutlineVectors(points: Array<[number, number]>): THREE.Vector2[] {
+  return points
+    .filter((point) => Array.isArray(point) && Number.isFinite(point[0]) && Number.isFinite(point[1]))
+    .map(([x, y]) => new THREE.Vector2(x, y));
+}
+
+function normalizePrefabPlacementPresets(placements: PrefabPlacementPreset[]): PrefabPlacementPreset[] {
+  return placements.flatMap((placement) => {
+    const hasDefinition = PREFAB_BUILDINGS.some((definition) => definition.key === placement.key);
+    const rotation = Number.isInteger(placement.rotation) ? placement.rotation : 0;
+    if (
+      !hasDefinition ||
+      !Number.isFinite(placement.originX) ||
+      !Number.isFinite(placement.originZ) ||
+      rotation < 0 ||
+      rotation > 7
+    ) {
+      return [];
+    }
+
+    return [
+      {
+        key: placement.key,
+        originX: Math.round(placement.originX),
+        originZ: Math.round(placement.originZ),
+        rotation: rotation as PrefabRotation,
+      },
+    ];
+  });
+}
+
+function normalizeCameraPresetSettings(settings: CameraPresetSettings): CameraPresetSettings | null {
+  const { position, target, zoom } = settings;
+  const hasPosition = Array.isArray(position) && position.length === 3 && position.every(Number.isFinite);
+  const hasTarget = Array.isArray(target) && target.length === 3 && target.every(Number.isFinite);
+  if (!hasPosition || !hasTarget || !Number.isFinite(zoom)) {
+    return null;
+  }
+
+  return {
+    position: [position[0], position[1], position[2]],
+    target: [target[0], target[1], target[2]],
+    zoom,
+  };
+}
+
+function normalizeWalkwayPathGraph(graph: WalkwayPathGraph): WalkwayPathGraph | null {
+  if (!Array.isArray(graph.nodes) || !Array.isArray(graph.segments)) {
+    return null;
+  }
+
+  const nodes = graph.nodes.flatMap((node) => {
+    if (
+      typeof node.id !== 'string' ||
+      !Array.isArray(node.position) ||
+      node.position.length !== 2 ||
+      !Number.isFinite(node.position[0]) ||
+      !Number.isFinite(node.position[1])
+    ) {
+      return [];
+    }
+
+    return [
+      {
+        id: node.id,
+        position: [node.position[0], node.position[1]] as [number, number],
+        buildingIndex: Number.isInteger(node.buildingIndex) ? node.buildingIndex : undefined,
+      },
+    ];
+  });
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const segments = graph.segments.filter(
+    (segment) =>
+      nodeIds.has(segment.from) &&
+      nodeIds.has(segment.to) &&
+      segment.from !== segment.to &&
+      (segment.kind === 'trunk' || segment.kind === 'branch'),
+  );
+
+  return nodes.length >= 2 && segments.length > 0 ? { nodes, segments } : null;
+}
+
+function closestPointOnSegment(point: THREE.Vector2, start: THREE.Vector2, end: THREE.Vector2): THREE.Vector2 {
+  const segment = end.clone().sub(start);
+  const lengthSq = segment.lengthSq();
+  if (lengthSq === 0) {
+    return start.clone();
+  }
+
+  const t = THREE.MathUtils.clamp(point.clone().sub(start).dot(segment) / lengthSq, 0, 1);
+  return start.clone().addScaledVector(segment, t);
+}
+
+function closestPointOnPolygonBoundary(point: THREE.Vector2, polygon: THREE.Vector2[]): THREE.Vector2 {
+  let closest = polygon[0]?.clone() ?? point.clone();
+  let closestDistanceSq = Infinity;
+  for (let index = 0; index < polygon.length; index += 1) {
+    const start = polygon[index];
+    const end = polygon[(index + 1) % polygon.length];
+    const candidate = closestPointOnSegment(point, start, end);
+    const distanceSq = candidate.distanceToSquared(point);
+    if (distanceSq < closestDistanceSq) {
+      closest = candidate;
+      closestDistanceSq = distanceSq;
+    }
+  }
+  return closest;
 }
 
 function getTreeGeometry(name: 'trunk' | 'foliage'): THREE.BufferGeometry {
@@ -1048,6 +1504,19 @@ function createIslandTop(outlinePoints: THREE.Vector2[], topY: number, grassText
   const geometry = new THREE.ShapeGeometry(shape);
   geometry.rotateX(-Math.PI / 2);
   geometry.translate(0, topY + TOP_LIFT, 0);
+  const bounds = new THREE.Box2().setFromPoints(outlinePoints);
+  const size = bounds.getSize(new THREE.Vector2());
+  const positions = geometry.attributes.position;
+  const uvs: number[] = [];
+  for (let index = 0; index < positions.count; index += 1) {
+    const x = positions.getX(index);
+    const z = positions.getZ(index);
+    uvs.push(
+      size.x === 0 ? 0 : (x - bounds.min.x) / size.x,
+      size.y === 0 ? 0 : (z - bounds.min.y) / size.y,
+    );
+  }
+  geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
   geometry.computeVertexNormals();
 
   const material = new THREE.MeshStandardMaterial({
@@ -1305,11 +1774,33 @@ export class SceneController {
   private readonly groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
   private readonly gui: GUI;
   private readonly guiControllers: GuiDisplayController[] = [];
+  private readonly prefabLayer = new THREE.Group();
+  private readonly walkwayLayer = new THREE.Group();
+  private readonly simulationLayer = new THREE.Group();
+  private readonly placedPrefabs: PlacedPrefab[] = [];
+  private readonly occupiedPrefabCells = new Set<string>();
   private presetSelectController: GuiOptionController | null = null;
+  private prefabStatusController: GuiDisplayController | null = null;
+  private pathStatusController: GuiDisplayController | null = null;
+  private prefabRotationController: GuiDisplayController | null = null;
+  private selectedPlacedPrefab: PlacedPrefab | null = null;
+  private selectedPrefabHelper: THREE.BoxHelper | null = null;
+  private prefabPlacementsToRestore: PrefabPlacementPreset[] | null = null;
+  private walkwayPathsToRestore: WalkwayPathGraph | null = null;
+  private cameraSettingsToRestore: CameraPresetSettings | null = null;
+  private walkwayPathGraph: WalkwayPathGraph | null = null;
   private presetNames: string[] = [];
   private readonly presetUi = {
     name: 'Island preset',
     selected: EMPTY_PRESET_OPTION,
+  };
+  private readonly prefabUi = {
+    selected: PREFAB_BUILDINGS[0].label,
+    placeMode: false,
+    editMode: false,
+    rotationDegrees: 0,
+    status: '',
+    pathStatus: '',
   };
   private readonly settings: IslandSettings = {
     rockSpacing: 0.78,
@@ -1353,6 +1844,9 @@ export class SceneController {
   private readonly waterSettings: WaterSettings = {
     clarity: 0.52,
     choppiness: 0.36,
+    edgeFog: true,
+    fogStart: 36,
+    fogEnd: 58,
   };
   private readonly vibeSettings: VibeSettings = {
     preset: 'Soft Morning',
@@ -1378,7 +1872,23 @@ export class SceneController {
   private activePointerId: number | null = null;
   private drawnOutline: THREE.Vector2[] = [];
   private lastGeneratedOutline: THREE.Vector2[] = [];
+  private currentIslandOutline: THREE.Vector2[] = [];
+  private selectedPrefabRotation: PrefabRotation = 0;
   private previewLine: THREE.Line | null = null;
+  private prefabPreview: THREE.Group | null = null;
+  private prefabPreviewWorldPosition: THREE.Vector2 | null = null;
+  private interactionMode: SceneInteractionMode = 'pan';
+  private readonly simulationWorkers: SimulationWorker[] = [];
+  private simulationDay = 1;
+  private simulationElapsedRealSeconds = 0;
+  private simulationClockMinutes = 0;
+  private simulationRunning = false;
+  private simulationPaused = false;
+  private simulationReturnStarted = false;
+  private simulationSpeed: 1 | 2 | 4 | 8 = 1;
+  private simulationMarqueePointerId: number | null = null;
+  private simulationMarqueeStart: THREE.Vector2 | null = null;
+  private lastFrameTime = performance.now();
   private readonly resizeObserver: ResizeObserver;
 
   public constructor(private readonly canvas: HTMLCanvasElement) {
@@ -1393,16 +1903,23 @@ export class SceneController {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1;
+    if (this.canvas.tabIndex < 0) {
+      this.canvas.tabIndex = 0;
+    }
     this.loadLastSavedPreset(false);
     this.grassTexture = createGrassTexture(this.grassSettings);
     this.waterMaterial = createLowPolyOceanMaterial(this.waterSettings);
+    this.prefabLayer.name = 'Placed prefab buildings';
+    this.walkwayLayer.name = 'Procedural walking pathways';
+    this.simulationLayer.name = 'Simulation workers';
+    this.scene.add(this.simulationLayer);
 
     this.controls = new OrbitControls(this.camera, this.canvas);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.target.set(0, 0.4, 0);
     this.controls.maxPolarAngle = Math.PI * 0.48;
-    this.controls.minZoom = 0.7;
+    this.controls.minZoom = 0.25;
     this.controls.maxZoom = 2.4;
 
     this.gui = this.createGui();
@@ -1415,7 +1932,368 @@ export class SceneController {
   public start(): void {
     this.resize();
     this.resizeObserver.observe(this.canvas);
+    this.setInteractionMode(this.interactionMode);
     this.tick();
+  }
+
+  public setInteractionMode(mode: SceneInteractionMode): void {
+    const leavingSimulation = this.interactionMode === 'simulate' && mode !== 'simulate';
+    if (leavingSimulation) {
+      this.stopSimulation();
+    }
+
+    this.interactionMode = mode;
+    this.prefabUi.placeMode = mode === 'build';
+    this.prefabUi.editMode = mode === 'edit';
+
+    if (mode !== 'build') {
+      this.removePrefabPreview();
+    }
+    if (mode !== 'edit') {
+      this.selectPlacedPrefab(null);
+    }
+    if (mode === 'path') {
+      this.renderWalkwayPathsFromPlacedPrefabs();
+    }
+    if (mode === 'simulate') {
+      this.startSimulation();
+    }
+
+    this.controls.enabled = mode === 'pan' || mode === 'path';
+    this.updateCanvasCursor();
+    this.updateGuiDisplays();
+    this.canvas.dispatchEvent(new CustomEvent<SceneInteractionMode>('scene-mode-change', { detail: mode }));
+    this.canvas.focus();
+  }
+
+  public continueSimulation(): void {
+    if (!this.simulationRunning || this.simulationDay >= SIMULATION_FINAL_DAY) {
+      return;
+    }
+
+    this.simulationDay += 1;
+    this.simulationElapsedRealSeconds = 0;
+    this.simulationClockMinutes = 0;
+    this.simulationReturnStarted = false;
+    this.simulationPaused = false;
+    this.clearSimulationWorkers();
+    this.spawnSimulationWorkers();
+    this.updateSimulationHud();
+  }
+
+  public cycleSimulationSpeed(): void {
+    this.simulationSpeed =
+      this.simulationSpeed === 1 ? 2 : this.simulationSpeed === 2 ? 4 : this.simulationSpeed === 4 ? 8 : 1;
+    this.updateSimulationSpeedButton();
+  }
+
+  private startSimulation(): void {
+    this.stopSimulation();
+
+    const store = this.readPresetStore();
+    if (store.presets['Full Build']) {
+      this.loadPreset('Full Build');
+    }
+    if (!this.walkwayPathGraph && this.hasAllRequiredPrefabBuildings()) {
+      this.renderWalkwayPathsFromPlacedPrefabs();
+    }
+
+    this.prefabUi.placeMode = false;
+    this.prefabUi.editMode = false;
+    this.simulationDay = 1;
+    this.simulationElapsedRealSeconds = 0;
+    this.simulationClockMinutes = 0;
+    this.simulationReturnStarted = false;
+    this.simulationPaused = false;
+    this.simulationSpeed = 1;
+    this.simulationRunning = true;
+    this.lastFrameTime = performance.now();
+    this.spawnSimulationWorkers();
+    this.updateSimulationHud();
+    this.updateSimulationSpeedButton();
+    document.querySelector<HTMLElement>('.simulation-hud')?.removeAttribute('hidden');
+    document.querySelector<HTMLElement>('.day-modal')?.setAttribute('hidden', '');
+  }
+
+  private stopSimulation(): void {
+    this.simulationRunning = false;
+    this.simulationPaused = false;
+    this.simulationMarqueePointerId = null;
+    this.simulationMarqueeStart = null;
+    this.clearSimulationWorkers();
+    document.querySelector<HTMLElement>('.simulation-hud')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.selection-marquee')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.day-modal')?.setAttribute('hidden', '');
+  }
+
+  private spawnSimulationWorkers(): void {
+    if (!this.walkwayPathGraph) {
+      return;
+    }
+
+    this.placedPrefabs.forEach((prefab, buildingIndex) => {
+      if (prefab.key !== 'house') {
+        return;
+      }
+
+      const homeNode = this.getBuildingPathNode(buildingIndex);
+      if (!homeNode) {
+        return;
+      }
+
+      const neighborNode = this.getConnectedPathNodes(homeNode.id)[0];
+      const homePosition = new THREE.Vector2(homeNode.position[0], homeNode.position[1]);
+      const neighborPosition = neighborNode
+        ? new THREE.Vector2(neighborNode.position[0], neighborNode.position[1])
+        : homePosition.clone();
+      const pathDirection = neighborPosition.sub(homePosition).normalize();
+
+      for (let workerIndex = 0; workerIndex < 2; workerIndex += 1) {
+        const material = new THREE.MeshStandardMaterial({
+          color: workerIndex === 0 ? 0x3f78a8 : 0xb9584d,
+          roughness: 0.78,
+        });
+        const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.4, 0.22), material);
+        const offset = 0.38 + workerIndex * 0.2;
+        mesh.position.set(
+          homePosition.x + pathDirection.x * offset,
+          this.settings.rockHeight + TOP_LIFT + 0.2,
+          homePosition.y + pathDirection.y * offset,
+        );
+        mesh.castShadow = true;
+        mesh.name = `Worker from house ${buildingIndex + 1}`;
+        this.simulationLayer.add(mesh);
+        this.simulationWorkers.push({
+          mesh,
+          homeBuildingIndex: buildingIndex,
+          currentNodeId: homeNode.id,
+          routeNodeIds: [],
+          routeIndex: 0,
+          selected: false,
+          speed: SIMULATION_WORKER_SPEED,
+        });
+      }
+    });
+  }
+
+  private clearSimulationWorkers(): void {
+    this.simulationWorkers.forEach((worker) => {
+      worker.mesh.removeFromParent();
+      worker.mesh.geometry.dispose();
+      worker.mesh.material.dispose();
+    });
+    this.simulationWorkers.length = 0;
+  }
+
+  private getBuildingPathNode(buildingIndex: number): WalkwayPathNode | null {
+    return this.walkwayPathGraph?.nodes.find((node) => node.buildingIndex === buildingIndex) ?? null;
+  }
+
+  private getPathNode(nodeId: string): WalkwayPathNode | null {
+    return this.walkwayPathGraph?.nodes.find((node) => node.id === nodeId) ?? null;
+  }
+
+  private getConnectedPathNodes(nodeId: string): WalkwayPathNode[] {
+    if (!this.walkwayPathGraph) {
+      return [];
+    }
+
+    const connectedIds = this.walkwayPathGraph.segments.flatMap((segment) =>
+      segment.from === nodeId ? [segment.to] : segment.to === nodeId ? [segment.from] : [],
+    );
+    return connectedIds
+      .map((connectedId) => this.getPathNode(connectedId))
+      .filter((node): node is WalkwayPathNode => Boolean(node));
+  }
+
+  private findPathNodeIds(startNodeId: string, endNodeId: string): string[] {
+    if (!this.walkwayPathGraph || startNodeId === endNodeId) {
+      return [startNodeId];
+    }
+
+    const queue = [startNodeId];
+    const previous = new Map<string, string | null>([[startNodeId, null]]);
+    while (queue.length > 0) {
+      const nodeId = queue.shift();
+      if (!nodeId) {
+        break;
+      }
+      if (nodeId === endNodeId) {
+        break;
+      }
+
+      this.getConnectedPathNodes(nodeId).forEach((neighbor) => {
+        if (!previous.has(neighbor.id)) {
+          previous.set(neighbor.id, nodeId);
+          queue.push(neighbor.id);
+        }
+      });
+    }
+
+    if (!previous.has(endNodeId)) {
+      return [];
+    }
+
+    const path: string[] = [];
+    let current: string | null = endNodeId;
+    while (current) {
+      path.unshift(current);
+      current = previous.get(current) ?? null;
+    }
+    return path;
+  }
+
+  private routeWorkerToBuilding(worker: SimulationWorker, buildingIndex: number): void {
+    const destinationNode = this.getBuildingPathNode(buildingIndex);
+    if (!destinationNode) {
+      return;
+    }
+
+    const currentTargetId = worker.routeNodeIds[worker.routeIndex];
+    const anchorNodeId = currentTargetId ?? worker.currentNodeId;
+    const path = this.findPathNodeIds(anchorNodeId, destinationNode.id);
+    if (path.length === 0) {
+      return;
+    }
+
+    worker.routeNodeIds = currentTargetId || path.length === 1 ? path : path.slice(1);
+    worker.routeIndex = 0;
+    worker.speed = SIMULATION_WORKER_SPEED;
+  }
+
+  private sendWorkersHome(currentMinute: number): void {
+    this.simulationReturnStarted = true;
+    const remainingRealSeconds =
+      (SIMULATION_DAY_MINUTES - currentMinute) / SIMULATION_MINUTES_PER_REAL_SECOND;
+
+    this.simulationWorkers.forEach((worker) => {
+      this.routeWorkerToBuilding(worker, worker.homeBuildingIndex);
+      const remainingDistance = this.getWorkerRemainingRouteDistance(worker);
+      worker.speed = remainingDistance > 0 ? remainingDistance / Math.max(0.01, remainingRealSeconds) : 0;
+      this.setWorkerSelected(worker, false);
+    });
+  }
+
+  private getWorkerRemainingRouteDistance(worker: SimulationWorker): number {
+    let distance = 0;
+    const currentPosition = new THREE.Vector2(worker.mesh.position.x, worker.mesh.position.z);
+    for (let index = worker.routeIndex; index < worker.routeNodeIds.length; index += 1) {
+      const node = this.getPathNode(worker.routeNodeIds[index]);
+      if (!node) {
+        continue;
+      }
+      const nodePosition = new THREE.Vector2(node.position[0], node.position[1]);
+      distance += currentPosition.distanceTo(nodePosition);
+      currentPosition.copy(nodePosition);
+    }
+    return distance;
+  }
+
+  private updateSimulation(deltaSeconds: number): void {
+    if (!this.simulationRunning || this.simulationPaused) {
+      return;
+    }
+
+    this.simulationElapsedRealSeconds += deltaSeconds;
+    const exactMinutes = this.simulationElapsedRealSeconds * SIMULATION_MINUTES_PER_REAL_SECOND;
+    const steppedMinutes =
+      Math.floor(exactMinutes / SIMULATION_CLOCK_STEP_MINUTES) * SIMULATION_CLOCK_STEP_MINUTES;
+    const nextClockMinutes = Math.min(SIMULATION_DAY_MINUTES, steppedMinutes);
+    if (nextClockMinutes !== this.simulationClockMinutes) {
+      this.simulationClockMinutes = nextClockMinutes;
+      this.updateSimulationHud();
+    }
+
+    if (!this.simulationReturnStarted && exactMinutes >= SIMULATION_RETURN_MINUTE) {
+      this.sendWorkersHome(exactMinutes);
+    }
+
+    this.updateSimulationWorkers(deltaSeconds);
+    if (exactMinutes >= SIMULATION_DAY_MINUTES) {
+      this.simulationClockMinutes = SIMULATION_DAY_MINUTES;
+      this.updateSimulationHud();
+      this.finishSimulationDay();
+    }
+  }
+
+  private updateSimulationWorkers(deltaSeconds: number): void {
+    this.simulationWorkers.forEach((worker) => {
+      let remainingMovement = worker.speed * deltaSeconds;
+      while (remainingMovement > 0 && worker.routeIndex < worker.routeNodeIds.length) {
+        const targetNode = this.getPathNode(worker.routeNodeIds[worker.routeIndex]);
+        if (!targetNode) {
+          worker.routeIndex += 1;
+          continue;
+        }
+
+        const target = new THREE.Vector2(targetNode.position[0], targetNode.position[1]);
+        const position = new THREE.Vector2(worker.mesh.position.x, worker.mesh.position.z);
+        const distance = position.distanceTo(target);
+        if (distance <= remainingMovement || distance < 0.001) {
+          worker.mesh.position.x = target.x;
+          worker.mesh.position.z = target.y;
+          worker.currentNodeId = targetNode.id;
+          worker.routeIndex += 1;
+          remainingMovement -= distance;
+          continue;
+        }
+
+        position.lerp(target, remainingMovement / distance);
+        worker.mesh.position.x = position.x;
+        worker.mesh.position.z = position.y;
+        remainingMovement = 0;
+      }
+
+      if (worker.routeIndex >= worker.routeNodeIds.length) {
+        worker.routeNodeIds = [];
+        worker.routeIndex = 0;
+      }
+    });
+  }
+
+  private updateSimulationHud(): void {
+    const date = document.querySelector<HTMLElement>('.simulation-hud__date');
+    const clock = document.querySelector<HTMLTimeElement>('.simulation-hud__clock');
+    if (date) {
+      date.textContent = `July ${this.simulationDay}`;
+    }
+    if (clock) {
+      const totalMinutes = SIMULATION_START_HOUR * 60 + this.simulationClockMinutes;
+      const hour24 = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      const hour12 = hour24 % 12 || 12;
+      const suffix = hour24 >= 12 ? 'PM' : 'AM';
+      clock.textContent = `${hour12}:${minutes.toString().padStart(2, '0')} ${suffix}`;
+      clock.dateTime = `2026-07-0${this.simulationDay}T${hour24.toString().padStart(2, '0')}:${minutes
+        .toString()
+        .padStart(2, '0')}`;
+    }
+  }
+
+  private updateSimulationSpeedButton(): void {
+    const button = document.querySelector<HTMLButtonElement>('.simulation-hud__speed');
+    if (button) {
+      button.textContent = `${this.simulationSpeed}×`;
+      button.setAttribute('aria-label', `Simulation speed ${this.simulationSpeed}x`);
+    }
+  }
+
+  private finishSimulationDay(): void {
+    this.simulationPaused = true;
+    this.simulationWorkers.forEach((worker) => this.setWorkerSelected(worker, false));
+    const modal = document.querySelector<HTMLElement>('.day-modal');
+    const title = document.querySelector<HTMLElement>('#day-modal-title');
+    if (title) {
+      title.textContent = this.simulationDay >= SIMULATION_FINAL_DAY ? 'Game Over' : "Today's progress";
+    }
+    modal?.removeAttribute('hidden');
+    document.querySelector<HTMLButtonElement>('.day-modal__button')?.focus();
+  }
+
+  private setWorkerSelected(worker: SimulationWorker, selected: boolean): void {
+    worker.selected = selected;
+    worker.mesh.material.emissive.setHex(selected ? 0xf4d17a : 0x000000);
+    worker.mesh.material.emissiveIntensity = selected ? 0.65 : 0;
   }
 
   public dispose(): void {
@@ -1423,8 +2301,13 @@ export class SceneController {
     cancelAnimationFrame(this.animationId);
     this.canvas.removeEventListener('pointerdown', this.startDrawing);
     this.canvas.removeEventListener('pointermove', this.updateDrawing);
+    this.canvas.removeEventListener('pointermove', this.updatePrefabPreview);
     this.canvas.removeEventListener('pointerup', this.finishDrawing);
     this.canvas.removeEventListener('pointercancel', this.finishDrawing);
+    window.removeEventListener('keydown', this.handleKeyDown);
+    this.stopSimulation();
+    this.clearPrefabPlacements(false);
+    this.removePrefabPreview();
     this.controls.dispose();
     this.gui.destroy();
     this.grassTexture.dispose();
@@ -1448,7 +2331,7 @@ export class SceneController {
     this.scene.add(this.ambientLight, this.sunLight, this.rimLight, this.fillLight);
 
     const ground = new THREE.Mesh(
-      new THREE.PlaneGeometry(70, 70, 34, 34).toNonIndexed(),
+      new THREE.PlaneGeometry(OCEAN_PLANE_SIZE, OCEAN_PLANE_SIZE, 72, 72).toNonIndexed(),
       this.waterMaterial,
     );
     ground.name = 'Procedural ocean water';
@@ -1459,8 +2342,13 @@ export class SceneController {
 
     this.camera.position.set(17, 18, 17);
     this.camera.lookAt(0, 0, 0);
+    this.applyPendingCameraSettings();
     this.applyVibe();
-    this.generateDefaultIsland();
+    if (this.lastGeneratedOutline.length >= 3) {
+      this.regenerateIsland();
+    } else {
+      this.generateDefaultIsland();
+    }
   }
 
   private readPresetStore(): PresetStore {
@@ -1503,13 +2391,69 @@ export class SceneController {
 
   private createPresetSnapshot(): ProceduralPreset {
     return {
+      outlinePoints: this.lastGeneratedOutline.map((point) => [point.x, point.y]),
       settings: { ...this.settings },
       grassSettings: { ...this.grassSettings },
       treeSettings: { ...this.treeSettings },
       stoneSettings: { ...this.stoneSettings },
       waterSettings: { ...this.waterSettings },
       vibeSettings: { ...this.vibeSettings },
+      cameraSettings: this.createCameraPresetSnapshot(),
+      prefabSettings: {
+        selected: this.prefabUi.selected,
+        placeMode: this.prefabUi.placeMode,
+        editMode: this.prefabUi.editMode,
+        rotationDegrees: this.prefabUi.rotationDegrees,
+      },
+      prefabPlacements: this.placedPrefabs.map((prefab) => ({
+        key: prefab.key,
+        originX: prefab.placement.originX,
+        originZ: prefab.placement.originZ,
+        rotation: prefab.rotation,
+      })),
+      walkwayPaths: this.walkwayPathGraph ? this.createWalkwayPathPresetSnapshot() : undefined,
     };
+  }
+
+  private createWalkwayPathPresetSnapshot(): WalkwayPathGraph | undefined {
+    if (!this.walkwayPathGraph) {
+      return undefined;
+    }
+
+    return {
+      nodes: this.walkwayPathGraph.nodes.map((node) => ({
+        id: node.id,
+        position: [node.position[0], node.position[1]] as [number, number],
+        buildingIndex: node.buildingIndex,
+      })),
+      segments: this.walkwayPathGraph.segments.map((segment) => ({ ...segment })),
+    };
+  }
+
+  private createCameraPresetSnapshot(): CameraPresetSettings {
+    return {
+      position: [this.camera.position.x, this.camera.position.y, this.camera.position.z],
+      target: [this.controls.target.x, this.controls.target.y, this.controls.target.z],
+      zoom: this.camera.zoom,
+    };
+  }
+
+  private applyCameraSettings(settings: CameraPresetSettings): void {
+    this.camera.position.set(...settings.position);
+    this.controls.target.set(...settings.target);
+    this.camera.zoom = THREE.MathUtils.clamp(settings.zoom, this.controls.minZoom, this.controls.maxZoom);
+    this.camera.updateProjectionMatrix();
+    this.controls.update();
+  }
+
+  private applyPendingCameraSettings(): void {
+    if (!this.cameraSettingsToRestore) {
+      return;
+    }
+
+    const settings = this.cameraSettingsToRestore;
+    this.cameraSettingsToRestore = null;
+    this.applyCameraSettings(settings);
   }
 
   private refreshPresetNames(store = this.readPresetStore()): void {
@@ -1533,6 +2477,12 @@ export class SceneController {
   }
 
   private applyProceduralPreset(preset: Partial<ProceduralPreset>, refreshScene: boolean): void {
+    if (preset.outlinePoints) {
+      const outlinePoints = createOutlineVectors(preset.outlinePoints);
+      if (outlinePoints.length >= 3) {
+        this.lastGeneratedOutline = outlinePoints;
+      }
+    }
     if (preset.settings) {
       Object.assign(this.settings, preset.settings);
     }
@@ -1554,13 +2504,30 @@ export class SceneController {
         this.vibeSettings.preset = 'Soft Morning';
       }
     }
+    this.cameraSettingsToRestore = preset.cameraSettings ? normalizeCameraPresetSettings(preset.cameraSettings) : null;
+    if (preset.prefabSettings) {
+      if (PREFAB_BUILDING_LABELS.includes(preset.prefabSettings.selected)) {
+        this.prefabUi.selected = preset.prefabSettings.selected;
+      }
+      this.prefabUi.placeMode = Boolean(preset.prefabSettings.placeMode);
+      this.prefabUi.editMode = Boolean(preset.prefabSettings.editMode);
+      if (this.prefabUi.placeMode && this.prefabUi.editMode) {
+        this.prefabUi.editMode = false;
+      }
+      this.prefabUi.rotationDegrees = getPrefabRotationFromDegrees(preset.prefabSettings.rotationDegrees) * 45;
+      this.selectedPrefabRotation = getPrefabRotationFromDegrees(this.prefabUi.rotationDegrees);
+    }
+    this.prefabPlacementsToRestore = preset.prefabPlacements ? normalizePrefabPlacementPresets(preset.prefabPlacements) : null;
+    this.walkwayPathsToRestore = preset.walkwayPaths ? normalizeWalkwayPathGraph(preset.walkwayPaths) : null;
 
     this.updateGuiDisplays();
+    this.updateCanvasCursor();
     if (refreshScene) {
       this.updateGrassTexture();
       this.updateWaterSurface();
       this.regenerateIsland();
       this.applyVibe();
+      this.applyPendingCameraSettings();
     }
   }
 
@@ -1638,25 +2605,71 @@ export class SceneController {
     presetFolder.add({ loadPreset: () => this.loadPreset() }, 'loadPreset').name('Load preset');
     presetFolder.open();
 
-    regenerateOnMouseUp(trackController(gui.add(this.settings, 'rockSpacing', 0.35, 1.8, 0.01).name('Rock spacing')));
-    regenerateOnMouseUp(trackController(gui.add(this.settings, 'rockiness', 0, 1, 0.01).name('Rockiness')));
-    regenerateOnMouseUp(trackController(gui.add(this.settings, 'vertexCount', 8, 90, 1).name('Island vertices')));
-    regenerateOnMouseUp(trackController(gui.add(this.settings, 'rockDetail', 0, 1, 0.01).name('Rock detail')));
-    regenerateOnMouseUp(trackController(gui.add(this.settings, 'rockHeight', 0.45, 2, 0.01).name('Rock height')));
-    regenerateOnMouseUp(
-      trackController(gui.add(this.settings, 'rockHeightJitter', 0, 0.55, 0.01).name('Height jitter')),
+    const prefabFolder = gui.addFolder('Prefab Buildings');
+    trackController(
+      prefabFolder
+        .add(this.prefabUi, 'selected', PREFAB_BUILDING_LABELS)
+        .name('Building')
+        .onChange(() => this.handlePrefabSelectionChange()),
     );
-    regenerateOnMouseUp(trackController(gui.add(this.settings, 'rockDepth', 0.35, 1.8, 0.01).name('Rock depth')));
+    trackController(
+      prefabFolder
+        .add(this.prefabUi, 'placeMode')
+        .name('Place mode')
+        .onChange((enabled: boolean) => this.setPrefabPlaceMode(enabled)),
+    );
+    trackController(
+      prefabFolder
+        .add(this.prefabUi, 'editMode')
+        .name('Edit buildings')
+        .onChange((enabled: boolean) => this.setPrefabEditMode(enabled)),
+    );
+    this.prefabRotationController = trackController(
+      prefabFolder
+        .add(this.prefabUi, 'rotationDegrees', 0, 315, 45)
+        .name('Rotation')
+        .onChange((degrees: number) => this.setPrefabRotationFromSlider(degrees)),
+    );
+    this.prefabStatusController = trackController(prefabFolder.add(this.prefabUi, 'status').name('Required'));
+    this.pathStatusController = trackController(prefabFolder.add(this.prefabUi, 'pathStatus').name('Pathways'));
+    prefabFolder
+      .add({ renderPathways: () => this.renderWalkwayPathsFromPlacedPrefabs() }, 'renderPathways')
+      .name('Render pathways');
+    prefabFolder.add({ clear: () => this.clearPrefabPlacements(true) }, 'clear').name('Clear buildings');
+    this.updatePrefabStatus();
+    prefabFolder.open();
+
+    const islandEdgeFolder = gui.addFolder('Island Edge');
     regenerateOnMouseUp(
-      trackController(gui.add(this.settings, 'rockDepthJitter', 0, 0.45, 0.01).name('Depth jitter')),
+      trackController(islandEdgeFolder.add(this.settings, 'rockSpacing', 0.35, 1.8, 0.01).name('Block spacing')),
+    );
+    regenerateOnMouseUp(trackController(islandEdgeFolder.add(this.settings, 'rockiness', 0, 1, 0.01).name('Coast shape')));
+    regenerateOnMouseUp(
+      trackController(islandEdgeFolder.add(this.settings, 'vertexCount', 8, 90, 1).name('Edge vertices')),
     );
     regenerateOnMouseUp(
-      trackController(gui.add(this.settings, 'rockColorJitter', 0, 1, 0.01).name('Rock color jitter')),
+      trackController(islandEdgeFolder.add(this.settings, 'rockDetail', 0, 1, 0.01).name('Block detail')),
     );
     regenerateOnMouseUp(
-      trackController(gui.add(this.settings, 'hiddenOverlap', 0.01, 0.08, 0.001).name('Hidden overlap')),
+      trackController(islandEdgeFolder.add(this.settings, 'rockHeight', 0.45, 2, 0.01).name('Edge height')),
     );
-    regenerateOnMouseUp(trackController(gui.add(this.settings, 'seed', 1, 9999, 1).name('Seed')));
+    regenerateOnMouseUp(
+      trackController(islandEdgeFolder.add(this.settings, 'rockHeightJitter', 0, 0.55, 0.01).name('Height jitter')),
+    );
+    regenerateOnMouseUp(
+      trackController(islandEdgeFolder.add(this.settings, 'rockDepth', 0.35, 1.8, 0.01).name('Edge depth')),
+    );
+    regenerateOnMouseUp(
+      trackController(islandEdgeFolder.add(this.settings, 'rockDepthJitter', 0, 0.45, 0.01).name('Depth jitter')),
+    );
+    regenerateOnMouseUp(
+      trackController(islandEdgeFolder.add(this.settings, 'rockColorJitter', 0, 1, 0.01).name('Color jitter')),
+    );
+    regenerateOnMouseUp(
+      trackController(islandEdgeFolder.add(this.settings, 'hiddenOverlap', 0.01, 0.08, 0.001).name('Block overlap')),
+    );
+    regenerateOnMouseUp(trackController(islandEdgeFolder.add(this.settings, 'seed', 1, 9999, 1).name('Seed')));
+    islandEdgeFolder.open(false);
 
     const grassFolder = gui.addFolder('Grass Texture');
     const updateGrassOnChange = <K extends keyof GrassTextureSettings>(
@@ -1728,6 +2741,13 @@ export class SceneController {
     );
     choppinessController.onChange(() => this.updateWaterSurface());
     choppinessController.onFinishChange(() => this.regenerateIsland());
+    trackController(waterFolder.add(this.waterSettings, 'edgeFog').name('Edge fog')).onChange(() => this.updateOceanFog());
+    trackController(waterFolder.add(this.waterSettings, 'fogStart', 10, 80, 1).name('Fog start')).onChange(() =>
+      this.updateOceanFog(),
+    );
+    trackController(waterFolder.add(this.waterSettings, 'fogEnd', 20, 120, 1).name('Fog end')).onChange(() =>
+      this.updateOceanFog(),
+    );
     waterFolder.open();
 
     const treeFolder = gui.addFolder('Tree Generator');
@@ -1845,15 +2865,26 @@ export class SceneController {
 
   private updateGrassTexture(): void {
     const previousTexture = this.grassTexture;
-    this.grassTexture = createGrassTexture(this.grassSettings);
+    this.grassTexture = createGrassTexture(this.grassSettings, this.createGrassTexturePathOverlay());
     this.applyGrassTextureToIsland();
     previousTexture.dispose();
+  }
+
+  private createGrassTexturePathOverlay(): GrassTexturePathOverlay | undefined {
+    if (!this.walkwayPathGraph || this.currentIslandOutline.length < 3) {
+      return undefined;
+    }
+
+    return {
+      bounds: new THREE.Box2().setFromPoints(this.currentIslandOutline),
+      graph: this.walkwayPathGraph,
+    };
   }
 
   private updateWaterSurface(): void {
     this.waterMaterial.uniforms.uClarity.value = this.waterSettings.clarity;
     this.waterMaterial.uniforms.uChoppiness.value = this.waterSettings.choppiness;
-    this.waterMaterial.uniforms.uAmplitude.value = THREE.MathUtils.lerp(0.04, 0.28, this.waterSettings.choppiness);
+    this.waterMaterial.uniforms.uAmplitude.value = THREE.MathUtils.lerp(0.12, 0.62, this.waterSettings.choppiness);
     this.waterMaterial.uniforms.uFrequency.value = THREE.MathUtils.lerp(0.22, 0.62, this.waterSettings.choppiness);
     this.waterMaterial.uniforms.uSpeed.value = THREE.MathUtils.lerp(0.55, 1.75, this.waterSettings.choppiness);
     this.applyVibe();
@@ -1942,16 +2973,31 @@ export class SceneController {
     });
   }
 
+  private updateOceanFog(vibe = this.getCurrentVibe()): void {
+    if (!this.waterSettings.edgeFog) {
+      this.scene.fog = null;
+      return;
+    }
+
+    const near = Math.min(this.waterSettings.fogStart, this.waterSettings.fogEnd - 1);
+    const far = Math.max(this.waterSettings.fogEnd, near + 1);
+    const fogColor = new THREE.Color(vibe.fog).lerp(new THREE.Color(vibe.background), 0.28);
+
+    if (this.scene.fog instanceof THREE.Fog) {
+      this.scene.fog.color.copy(fogColor);
+      this.scene.fog.near = near;
+      this.scene.fog.far = far;
+      return;
+    }
+
+    this.scene.fog = new THREE.Fog(fogColor, near, far);
+  }
+
   private applyVibe(): void {
     const vibe = this.getCurrentVibe();
     const background = new THREE.Color(vibe.background);
-    const fog = new THREE.Color(vibe.fog);
     this.scene.background = background;
-    if (this.scene.fog instanceof THREE.Fog) {
-      this.scene.fog.color.copy(fog);
-      this.scene.fog.near = THREE.MathUtils.lerp(34, 48, vibe.shadowLift);
-      this.scene.fog.far = THREE.MathUtils.lerp(54, 84, vibe.shadowLift);
-    }
+    this.updateOceanFog(vibe);
 
     const sunDistance = 25;
     const sunElevation = THREE.MathUtils.lerp(0.28, 1.12, vibe.sunHeight);
@@ -2024,14 +3070,702 @@ export class SceneController {
     this.updateShoreRippleVibe(vibe);
   }
 
+  private getSelectedPrefabDefinition() {
+    return getPrefabDefinitionByLabel(this.prefabUi.selected);
+  }
+
+  private getPlacedPrefabCount(key: PrefabBuildingKey): number {
+    return this.placedPrefabs.filter((prefab) => prefab.key === key).length;
+  }
+
+  private updatePrefabStatus(): void {
+    const selected = this.getSelectedPrefabDefinition();
+    const selectedPlaced = this.getPlacedPrefabCount(selected.key);
+    const totalPlaced = this.placedPrefabs.length;
+    const totalRequired = PREFAB_BUILDINGS.reduce((sum, definition) => sum + definition.requiredCount, 0);
+    this.prefabUi.status = `${selected.label}: ${selectedPlaced}/${selected.requiredCount}, Total: ${totalPlaced}/${totalRequired}`;
+    this.prefabStatusController?.updateDisplay();
+    this.updatePathStatus();
+  }
+
+  private updatePathStatus(): void {
+    if (!this.hasAllRequiredPrefabBuildings()) {
+      const totalRequired = PREFAB_BUILDINGS.reduce((sum, definition) => sum + definition.requiredCount, 0);
+      this.prefabUi.pathStatus = `Place all ${totalRequired} buildings`;
+    } else if (this.walkwayPathGraph) {
+      this.prefabUi.pathStatus = `${this.walkwayPathGraph.segments.length} path segments`;
+    } else {
+      this.prefabUi.pathStatus = 'Ready to render';
+    }
+    this.pathStatusController?.updateDisplay();
+  }
+
+  private hasAllRequiredPrefabBuildings(): boolean {
+    return PREFAB_BUILDINGS.every((definition) => this.getPlacedPrefabCount(definition.key) >= definition.requiredCount);
+  }
+
+  private renderWalkwayPathsFromPlacedPrefabs(): void {
+    if (!this.hasAllRequiredPrefabBuildings()) {
+      this.updatePathStatus();
+      return;
+    }
+
+    const graph = this.createWalkwayPathGraphFromPlacedPrefabs();
+    this.renderWalkwayPathGraph(graph);
+  }
+
+  private createWalkwayPathGraphFromPlacedPrefabs(): WalkwayPathGraph {
+    const entries = this.placedPrefabs.map((prefab, index) => {
+      const definition = getPrefabDefinition(prefab.key);
+      const center = getPrefabWorldCenter(definition, prefab.placement);
+      const footprint = getPrefabWorldFootprintCorners(definition, prefab.placement);
+      return { index, center, footprint };
+    });
+
+    const centroid = entries
+      .reduce((sum, entry) => sum.add(entry.center), new THREE.Vector2())
+      .multiplyScalar(entries.length > 0 ? 1 / entries.length : 1);
+    const axis = this.getMainWalkwayAxis(entries.map((entry) => entry.center));
+    const ordered = entries
+      .map((entry) => {
+        const projection = entry.center.clone().sub(centroid).dot(axis);
+        const trunkPoint = centroid.clone().addScaledVector(axis, projection);
+        const safeTrunkPoint = pointInPolygon(trunkPoint, this.currentIslandOutline) ? trunkPoint : entry.center.clone();
+        const edgePoint = closestPointOnPolygonBoundary(safeTrunkPoint, entry.footprint);
+        const branchEnd = edgePoint.clone().lerp(entry.center, 0.12);
+        return { ...entry, projection, trunkPoint: safeTrunkPoint, branchEnd };
+      })
+      .sort((first, second) => first.projection - second.projection);
+
+    const nodes: WalkwayPathNode[] = [];
+    const segments: WalkwayPathSegment[] = [];
+    ordered.forEach((entry, orderIndex) => {
+      const trunkId = `trunk-${orderIndex}`;
+      const entryId = `building-${entry.index}`;
+      nodes.push(
+        {
+          id: trunkId,
+          position: [entry.trunkPoint.x, entry.trunkPoint.y],
+        },
+        {
+          id: entryId,
+          position: [entry.branchEnd.x, entry.branchEnd.y],
+          buildingIndex: entry.index,
+        },
+      );
+      if (orderIndex > 0) {
+        segments.push({ from: `trunk-${orderIndex - 1}`, to: trunkId, kind: 'trunk' });
+      }
+      if (entry.trunkPoint.distanceTo(entry.branchEnd) > 0.05) {
+        segments.push({ from: trunkId, to: entryId, kind: 'branch' });
+      }
+    });
+
+    return { nodes, segments };
+  }
+
+  private getMainWalkwayAxis(points: THREE.Vector2[]): THREE.Vector2 {
+    if (points.length < 2) {
+      return new THREE.Vector2(1, 0);
+    }
+
+    let first = points[0];
+    let second = points[1];
+    let farthestDistanceSq = first.distanceToSquared(second);
+    for (let firstIndex = 0; firstIndex < points.length; firstIndex += 1) {
+      for (let secondIndex = firstIndex + 1; secondIndex < points.length; secondIndex += 1) {
+        const distanceSq = points[firstIndex].distanceToSquared(points[secondIndex]);
+        if (distanceSq > farthestDistanceSq) {
+          first = points[firstIndex];
+          second = points[secondIndex];
+          farthestDistanceSq = distanceSq;
+        }
+      }
+    }
+
+    return second.clone().sub(first).normalize();
+  }
+
+  private renderWalkwayPathGraph(graph: WalkwayPathGraph): void {
+    this.clearWalkwayPaths(false);
+    this.walkwayPathGraph = graph;
+    this.walkwayLayer.position.set(0, 0, 0);
+    this.updateGrassTexture();
+    this.updatePathStatus();
+  }
+
+  private clearWalkwayPaths(clearGraph: boolean, updateTexture = true): void {
+    this.walkwayLayer.children.slice().forEach((child) => {
+      child.removeFromParent();
+      this.disposeObjectTree(child);
+    });
+    if (clearGraph) {
+      this.walkwayPathGraph = null;
+      if (updateTexture && this.island) {
+        this.updateGrassTexture();
+      }
+    }
+    this.updatePathStatus();
+  }
+
+  private handlePrefabSelectionChange(): void {
+    this.removePrefabPreview();
+    this.updatePrefabStatus();
+  }
+
+  private setPrefabPlaceMode(enabled: boolean): void {
+    this.setInteractionMode(enabled ? 'build' : 'pan');
+  }
+
+  private setPrefabEditMode(enabled: boolean): void {
+    this.setInteractionMode(enabled ? 'edit' : 'pan');
+  }
+
+  private updateCanvasCursor(): void {
+    this.canvas.style.cursor =
+      this.interactionMode === 'build'
+        ? 'copy'
+        : this.interactionMode === 'edit'
+          ? 'pointer'
+          : this.interactionMode === 'path' || this.interactionMode === 'island'
+            ? 'crosshair'
+            : 'grab';
+  }
+
+  private setPrefabRotationFromSlider(degrees: number): void {
+    const snappedRotation = getPrefabRotationFromDegrees(degrees);
+    const snappedDegrees = snappedRotation * 45;
+    this.selectedPrefabRotation = snappedRotation;
+    this.prefabUi.rotationDegrees = snappedDegrees;
+    this.prefabRotationController?.updateDisplay();
+
+    if (this.selectedPlacedPrefab && this.prefabUi.editMode) {
+      this.selectedPlacedPrefab.rotation = snappedRotation;
+      this.selectedPlacedPrefab.group.rotation.y = getPrefabRotationRadians(snappedRotation);
+      this.selectedPrefabHelper?.update();
+      this.clearWalkwayPaths(true);
+    }
+
+    this.removePrefabPreview(false);
+    this.refreshPrefabPreviewAtLastPosition();
+  }
+
+  private rotatePlacementPreviewByStep(): void {
+    this.setPrefabRotationFromSlider(this.selectedPrefabRotation * 45 + 45);
+  }
+
+  private refreshPrefabPreviewAtLastPosition(): void {
+    if (!this.prefabUi.placeMode || !this.prefabPreviewWorldPosition) {
+      return;
+    }
+
+    const definition = this.getSelectedPrefabDefinition();
+    const placement = getPrefabPlacementForWorldPoint(definition, this.prefabPreviewWorldPosition, this.selectedPrefabRotation);
+    this.refreshPrefabPreview(placement, this.canPlacePrefab(definition, placement));
+  }
+
+  private canPlacePrefab(definition: ReturnType<typeof getPrefabDefinitionByLabel>, placement: PrefabGridPlacement): boolean {
+    if (this.currentIslandOutline.length < 3) {
+      return false;
+    }
+
+    if (this.getPlacedPrefabCount(definition.key) >= definition.requiredCount) {
+      return false;
+    }
+
+    const cells = getPrefabFootprintCells(definition, placement);
+    if (cells.some((cell) => this.occupiedPrefabCells.has(getPrefabCellKey(cell)))) {
+      return false;
+    }
+
+    const footprintPoints = [
+      ...cells.map((cell) => getPrefabCellCenter(cell)),
+      ...getPrefabWorldFootprintCorners(definition, placement),
+    ];
+
+    return footprintPoints.every((point) => pointInPolygon(point, this.currentIslandOutline));
+  }
+
+  private placeSelectedPrefab(event: PointerEvent): void {
+    if (event.pointerType === 'mouse' && event.button !== 0) {
+      return;
+    }
+
+    const worldPosition = this.getPointerWorldPosition(event);
+    if (!worldPosition) {
+      return;
+    }
+
+    event.preventDefault();
+    const definition = this.getSelectedPrefabDefinition();
+    const placement = getPrefabPlacementForWorldPoint(definition, worldPosition, this.selectedPrefabRotation);
+    const canPlace = this.canPlacePrefab(definition, placement);
+    this.refreshPrefabPreview(placement, canPlace);
+    if (!canPlace) {
+      return;
+    }
+
+    const placedPrefab = this.createPlacedPrefab(definition, placement, true);
+    this.removePrefabPreview();
+    this.selectPlacedPrefab(placedPrefab);
+    this.clearWalkwayPaths(true);
+    this.applyVibe();
+    this.updatePrefabStatus();
+  }
+
+  private createPlacedPrefab(
+    definition: ReturnType<typeof getPrefabDefinitionByLabel>,
+    placement: PrefabGridPlacement,
+    clearNaturalObjects: boolean,
+  ): PlacedPrefab {
+    const group = createPrefabBuilding(definition);
+    const center = getPrefabWorldCenter(definition, placement);
+    const cells = getPrefabFootprintCells(definition, placement).map((cell) => getPrefabCellKey(cell));
+    if (clearNaturalObjects) {
+      this.clearNaturalObjectsIntersectingPrefab(definition, placement);
+    }
+    group.position.set(center.x, this.settings.rockHeight + TOP_LIFT, center.y);
+    group.rotation.y = getPrefabRotationRadians(placement.rotation);
+    this.prefabLayer.add(group);
+
+    const placedPrefab = { key: definition.key, group, cells, rotation: placement.rotation, placement: { ...placement } };
+    this.placedPrefabs.push(placedPrefab);
+    cells.forEach((cell) => this.occupiedPrefabCells.add(cell));
+    return placedPrefab;
+  }
+
+  private restorePrefabPlacements(placements: PrefabPlacementPreset[]): void {
+    this.clearPrefabPlacements(false);
+    placements.forEach((placement) => {
+      const definition = getPrefabDefinition(placement.key);
+      this.createPlacedPrefab(definition, placement, true);
+    });
+    this.updatePrefabStatus();
+  }
+
+  private selectPlacedPrefab(prefab: PlacedPrefab | null): void {
+    this.removeSelectedPrefabHelper();
+    this.selectedPlacedPrefab = prefab;
+    if (!prefab) {
+      return;
+    }
+
+    this.selectedPrefabRotation = prefab.rotation;
+    this.prefabUi.rotationDegrees = prefab.rotation * 45;
+    this.prefabRotationController?.updateDisplay();
+
+    this.selectedPrefabHelper = new THREE.BoxHelper(prefab.group, 0xffe37a);
+    this.selectedPrefabHelper.name = 'Selected prefab outline';
+    this.scene.add(this.selectedPrefabHelper);
+  }
+
+  private deleteSelectedPrefab(): void {
+    const prefab = this.selectedPlacedPrefab;
+    if (!prefab) {
+      return;
+    }
+
+    this.selectPlacedPrefab(null);
+    prefab.cells.forEach((cell) => this.occupiedPrefabCells.delete(cell));
+    const index = this.placedPrefabs.indexOf(prefab);
+    if (index >= 0) {
+      this.placedPrefabs.splice(index, 1);
+    }
+    prefab.group.removeFromParent();
+    this.disposeObjectTree(prefab.group);
+    this.clearWalkwayPaths(true);
+    this.updatePrefabStatus();
+  }
+
+  private removeSelectedPrefabHelper(): void {
+    if (!this.selectedPrefabHelper) {
+      return;
+    }
+
+    this.selectedPrefabHelper.removeFromParent();
+    this.selectedPrefabHelper.geometry.dispose();
+    const material = this.selectedPrefabHelper.material;
+    if (Array.isArray(material)) {
+      material.forEach((entry) => entry.dispose());
+    } else {
+      material.dispose();
+    }
+    this.selectedPrefabHelper = null;
+  }
+
+  private selectPrefabAtPointer(event: PointerEvent): boolean {
+    if (this.placedPrefabs.length === 0 || (event.pointerType === 'mouse' && event.button !== 0)) {
+      return false;
+    }
+
+    const bounds = this.canvas.getBoundingClientRect();
+    this.pointer.set(
+      ((event.clientX - bounds.left) / bounds.width) * 2 - 1,
+      -((event.clientY - bounds.top) / bounds.height) * 2 + 1,
+    );
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+
+    const hits = this.raycaster.intersectObjects(this.prefabLayer.children, true);
+    for (const hit of hits) {
+      const prefab = this.getPlacedPrefabFromObject(hit.object);
+      if (!prefab) {
+        continue;
+      }
+
+      event.preventDefault();
+      this.selectPlacedPrefab(prefab);
+      return true;
+    }
+
+    return false;
+  }
+
+  private getPlacedPrefabFromObject(object: THREE.Object3D): PlacedPrefab | null {
+    let current: THREE.Object3D | null = object;
+    while (current) {
+      const prefab = this.placedPrefabs.find((entry) => entry.group === current);
+      if (prefab) {
+        return prefab;
+      }
+      current = current.parent;
+    }
+    return null;
+  }
+
+  private clearNaturalObjectsIntersectingPrefab(
+    definition: ReturnType<typeof getPrefabDefinitionByLabel>,
+    placement: PrefabGridPlacement,
+  ): NaturalObjectCleanupResult {
+    const footprint = this.createPrefabFootprintBox(definition, placement);
+    const treesRemoved = this.removeIntersectingTrees(footprint);
+    const stonesRemoved = this.hideIntersectingStoneInstances(footprint);
+    return { treesRemoved, stonesRemoved };
+  }
+
+  private createPrefabFootprintBox(
+    definition: ReturnType<typeof getPrefabDefinitionByLabel>,
+    placement: PrefabGridPlacement,
+  ): THREE.Box3 {
+    const corners = getPrefabWorldFootprintCorners(definition, placement);
+    const minX = Math.min(...corners.map((corner) => corner.x)) - PREFAB_NATURAL_OBJECT_CLEARANCE;
+    const maxX = Math.max(...corners.map((corner) => corner.x)) + PREFAB_NATURAL_OBJECT_CLEARANCE;
+    const minZ = Math.min(...corners.map((corner) => corner.y)) - PREFAB_NATURAL_OBJECT_CLEARANCE;
+    const maxZ = Math.max(...corners.map((corner) => corner.y)) + PREFAB_NATURAL_OBJECT_CLEARANCE;
+    return new THREE.Box3(
+      new THREE.Vector3(minX, this.settings.rockHeight - 0.08, minZ),
+      new THREE.Vector3(maxX, this.settings.rockHeight + 12, maxZ),
+    );
+  }
+
+  private removeIntersectingTrees(footprint: THREE.Box3): number {
+    if (!this.island) {
+      return 0;
+    }
+
+    const intersectingTrees: THREE.Object3D[] = [];
+    this.island.traverse((object) => {
+      if (object.name !== 'Procedural low-poly tree') {
+        return;
+      }
+
+      const treeBounds = new THREE.Box3().setFromObject(object);
+      if (treeBounds.intersectsBox(footprint)) {
+        intersectingTrees.push(object);
+      }
+    });
+
+    intersectingTrees.forEach((tree) => {
+      tree.removeFromParent();
+      this.disposeObjectTree(tree);
+    });
+    return intersectingTrees.length;
+  }
+
+  private hideIntersectingStoneInstances(footprint: THREE.Box3): number {
+    if (!this.island) {
+      return 0;
+    }
+
+    const instanceMatrix = new THREE.Matrix4();
+    const instanceWorldMatrix = new THREE.Matrix4();
+    const hiddenMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+    const instanceBounds = new THREE.Box3();
+    let stonesRemoved = 0;
+
+    this.island.traverse((object) => {
+      const mesh = object as THREE.InstancedMesh;
+      if (!mesh.isInstancedMesh || !mesh.name.endsWith('grass stones')) {
+        return;
+      }
+
+      mesh.geometry.computeBoundingBox();
+      const geometryBounds = mesh.geometry.boundingBox;
+      if (!geometryBounds) {
+        return;
+      }
+
+      for (let instanceIndex = 0; instanceIndex < mesh.count; instanceIndex += 1) {
+        mesh.getMatrixAt(instanceIndex, instanceMatrix);
+        if (isHiddenInstanceMatrix(instanceMatrix)) {
+          continue;
+        }
+
+        instanceWorldMatrix.multiplyMatrices(mesh.matrixWorld, instanceMatrix);
+        instanceBounds.copy(geometryBounds).applyMatrix4(instanceWorldMatrix);
+        if (!instanceBounds.intersectsBox(footprint)) {
+          continue;
+        }
+
+        mesh.setMatrixAt(instanceIndex, hiddenMatrix);
+        stonesRemoved += 1;
+      }
+
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.computeBoundingSphere();
+    });
+
+    return stonesRemoved;
+  }
+
+  private readonly updatePrefabPreview = (event: PointerEvent): void => {
+    if (!this.prefabUi.placeMode) {
+      return;
+    }
+
+    const worldPosition = this.getPointerWorldPosition(event);
+    if (!worldPosition) {
+      this.prefabPreviewWorldPosition = null;
+      this.removePrefabPreview();
+      return;
+    }
+
+    this.prefabPreviewWorldPosition = worldPosition;
+    const definition = this.getSelectedPrefabDefinition();
+    const placement = getPrefabPlacementForWorldPoint(definition, worldPosition, this.selectedPrefabRotation);
+    this.refreshPrefabPreview(placement, this.canPlacePrefab(definition, placement));
+  };
+
+  private refreshPrefabPreview(placement: PrefabGridPlacement, canPlace: boolean): void {
+    this.removePrefabPreview(false);
+    const definition = this.getSelectedPrefabDefinition();
+    this.prefabPreview = createPrefabPlacementPreview(definition, placement, canPlace);
+    this.prefabPreview.position.y = this.settings.rockHeight + TOP_LIFT + 0.025;
+    this.scene.add(this.prefabPreview);
+  }
+
+  private clearPrefabPlacements(updateStatus: boolean): void {
+    this.selectPlacedPrefab(null);
+    this.clearWalkwayPaths(true, updateStatus);
+    this.placedPrefabs.forEach((prefab) => {
+      prefab.group.removeFromParent();
+      this.disposeObjectTree(prefab.group);
+    });
+    this.placedPrefabs.length = 0;
+    this.occupiedPrefabCells.clear();
+    this.removePrefabPreview();
+    if (updateStatus) {
+      this.updatePrefabStatus();
+    }
+  }
+
+  private removePrefabPreview(clearPosition = true): void {
+    if (!this.prefabPreview) {
+      if (clearPosition) {
+        this.prefabPreviewWorldPosition = null;
+      }
+      return;
+    }
+
+    this.prefabPreview.removeFromParent();
+    this.disposeObjectTree(this.prefabPreview);
+    this.prefabPreview = null;
+    if (clearPosition) {
+      this.prefabPreviewWorldPosition = null;
+    }
+  }
+
+  private disposeObjectTree(root: THREE.Object3D): void {
+    const disposedGeometries = new Set<THREE.BufferGeometry>();
+    const disposedMaterials = new Set<THREE.Material>();
+    root.traverse((object) => {
+      const renderable = object as THREE.Object3D & {
+        geometry?: THREE.BufferGeometry;
+        material?: THREE.Material | THREE.Material[];
+      };
+
+      if (renderable.geometry && !disposedGeometries.has(renderable.geometry)) {
+        renderable.geometry.dispose();
+        disposedGeometries.add(renderable.geometry);
+      }
+
+      const materials = Array.isArray(renderable.material)
+        ? renderable.material
+        : renderable.material
+          ? [renderable.material]
+          : [];
+      materials.forEach((material) => {
+        if (disposedMaterials.has(material)) {
+          return;
+        }
+        const materialWithMap = material as THREE.Material & { map?: THREE.Texture | null };
+        materialWithMap.map?.dispose();
+        material.dispose();
+        disposedMaterials.add(material);
+      });
+    });
+  }
+
+  private handleSimulationPointerDown(event: PointerEvent): void {
+    if (!this.simulationRunning || this.simulationPaused || (event.pointerType === 'mouse' && event.button !== 0)) {
+      return;
+    }
+
+    const selectedWorkers = this.simulationWorkers.filter((worker) => worker.selected);
+    const buildingIndex = selectedWorkers.length > 0 ? this.getPrefabIndexAtPointer(event) : null;
+    if (buildingIndex !== null) {
+      event.preventDefault();
+      selectedWorkers.forEach((worker) => {
+        this.routeWorkerToBuilding(worker, buildingIndex);
+        this.setWorkerSelected(worker, false);
+      });
+      return;
+    }
+
+    event.preventDefault();
+    this.canvas.setPointerCapture(event.pointerId);
+    this.simulationMarqueePointerId = event.pointerId;
+    this.simulationMarqueeStart = new THREE.Vector2(event.clientX, event.clientY);
+    this.updateSimulationMarquee(event);
+  }
+
+  private updateSimulationMarquee(event: PointerEvent): void {
+    if (!this.simulationMarqueeStart) {
+      return;
+    }
+
+    const marquee = document.querySelector<HTMLElement>('.selection-marquee');
+    if (!marquee) {
+      return;
+    }
+
+    const left = Math.min(this.simulationMarqueeStart.x, event.clientX);
+    const top = Math.min(this.simulationMarqueeStart.y, event.clientY);
+    const width = Math.abs(event.clientX - this.simulationMarqueeStart.x);
+    const height = Math.abs(event.clientY - this.simulationMarqueeStart.y);
+    marquee.style.left = `${left}px`;
+    marquee.style.top = `${top}px`;
+    marquee.style.width = `${width}px`;
+    marquee.style.height = `${height}px`;
+    marquee.removeAttribute('hidden');
+  }
+
+  private finishSimulationMarquee(event: PointerEvent): void {
+    if (!this.simulationMarqueeStart) {
+      return;
+    }
+
+    event.preventDefault();
+    if (this.canvas.hasPointerCapture(event.pointerId)) {
+      this.canvas.releasePointerCapture(event.pointerId);
+    }
+
+    const left = Math.min(this.simulationMarqueeStart.x, event.clientX);
+    const right = Math.max(this.simulationMarqueeStart.x, event.clientX);
+    const top = Math.min(this.simulationMarqueeStart.y, event.clientY);
+    const bottom = Math.max(this.simulationMarqueeStart.y, event.clientY);
+    const canvasBounds = this.canvas.getBoundingClientRect();
+    const projected = new THREE.Vector3();
+
+    this.simulationWorkers.forEach((worker) => {
+      worker.mesh.getWorldPosition(projected);
+      projected.project(this.camera);
+      const screenX = canvasBounds.left + ((projected.x + 1) / 2) * canvasBounds.width;
+      const screenY = canvasBounds.top + ((1 - projected.y) / 2) * canvasBounds.height;
+      this.setWorkerSelected(
+        worker,
+        screenX >= left && screenX <= right && screenY >= top && screenY <= bottom,
+      );
+    });
+
+    this.simulationMarqueePointerId = null;
+    this.simulationMarqueeStart = null;
+    document.querySelector<HTMLElement>('.selection-marquee')?.setAttribute('hidden', '');
+  }
+
+  private getPrefabIndexAtPointer(event: PointerEvent): number | null {
+    const bounds = this.canvas.getBoundingClientRect();
+    this.pointer.set(
+      ((event.clientX - bounds.left) / bounds.width) * 2 - 1,
+      -((event.clientY - bounds.top) / bounds.height) * 2 + 1,
+    );
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+
+    const hits = this.raycaster.intersectObjects(this.prefabLayer.children, true);
+    for (const hit of hits) {
+      const prefab = this.getPlacedPrefabFromObject(hit.object);
+      if (!prefab) {
+        continue;
+      }
+      const index = this.placedPrefabs.indexOf(prefab);
+      return index >= 0 ? index : null;
+    }
+    return null;
+  }
+
   private bindDrawingEvents(): void {
     this.canvas.addEventListener('pointerdown', this.startDrawing);
     this.canvas.addEventListener('pointermove', this.updateDrawing);
+    this.canvas.addEventListener('pointermove', this.updatePrefabPreview);
     this.canvas.addEventListener('pointerup', this.finishDrawing);
     this.canvas.addEventListener('pointercancel', this.finishDrawing);
+    window.addEventListener('keydown', this.handleKeyDown);
   }
 
+  private readonly handleKeyDown = (event: KeyboardEvent): void => {
+    if (isTypingTarget(event.target)) {
+      return;
+    }
+
+    if (
+      event.key.toLowerCase() === 'r' &&
+      (this.prefabUi.placeMode || (this.prefabUi.editMode && this.selectedPlacedPrefab))
+    ) {
+      event.preventDefault();
+      this.rotatePlacementPreviewByStep();
+      return;
+    }
+
+    if (this.prefabUi.editMode && event.key === 'Delete' && this.selectedPlacedPrefab) {
+      event.preventDefault();
+      this.deleteSelectedPrefab();
+    }
+  };
+
   private readonly startDrawing = (event: PointerEvent): void => {
+    this.canvas.focus();
+
+    if (this.interactionMode === 'simulate') {
+      this.handleSimulationPointerDown(event);
+      return;
+    }
+
+    if (this.prefabUi.placeMode) {
+      this.placeSelectedPrefab(event);
+      return;
+    }
+
+    if (this.prefabUi.editMode) {
+      if (event.pointerType !== 'mouse' || event.button === 0) {
+        event.preventDefault();
+        this.selectPrefabAtPointer(event);
+      }
+      return;
+    }
+
+    if (this.interactionMode !== 'island') {
+      return;
+    }
+
     if ((event.pointerType === 'mouse' && event.button !== 0) || this.isDrawing) {
       return;
     }
@@ -2058,6 +3792,11 @@ export class SceneController {
   };
 
   private readonly updateDrawing = (event: PointerEvent): void => {
+    if (this.interactionMode === 'simulate' && event.pointerId === this.simulationMarqueePointerId) {
+      this.updateSimulationMarquee(event);
+      return;
+    }
+
     if (!this.isDrawing || event.pointerId !== this.activePointerId) {
       return;
     }
@@ -2076,6 +3815,11 @@ export class SceneController {
   };
 
   private readonly finishDrawing = (event: PointerEvent): void => {
+    if (this.interactionMode === 'simulate' && event.pointerId === this.simulationMarqueePointerId) {
+      this.finishSimulationMarquee(event);
+      return;
+    }
+
     if (!this.isDrawing || event.pointerId !== this.activePointerId) {
       return;
     }
@@ -2158,6 +3902,7 @@ export class SceneController {
       return;
     }
 
+    this.clearPrefabPlacements(true);
     this.removeIsland();
     const build = generateIslandFromOutline(
       this.lastGeneratedOutline,
@@ -2168,16 +3913,33 @@ export class SceneController {
       this.waterSettings,
     );
     this.island = build.root;
+    this.currentIslandOutline = build.processedOutline;
+    this.prefabLayer.position.set(0, 0, 0);
+    this.walkwayLayer.position.set(0, 0, 0);
+    this.island.add(this.prefabLayer);
+    this.island.add(this.walkwayLayer);
     this.scene.add(this.island);
+    if (this.prefabPlacementsToRestore) {
+      const placements = this.prefabPlacementsToRestore;
+      this.prefabPlacementsToRestore = null;
+      this.restorePrefabPlacements(placements);
+    }
+    if (this.walkwayPathsToRestore) {
+      const paths = this.walkwayPathsToRestore;
+      this.walkwayPathsToRestore = null;
+      this.renderWalkwayPathGraph(paths);
+    }
     this.applyVibe();
     this.removePreviewLine();
   }
 
   private clearIsland(): void {
+    this.clearPrefabPlacements(true);
     this.removeIsland();
     this.removePreviewLine();
     this.drawnOutline = [];
     this.lastGeneratedOutline = [];
+    this.currentIslandOutline = [];
   }
 
   private removeIsland(): void {
@@ -2185,7 +3947,9 @@ export class SceneController {
       return;
     }
 
+    this.clearPrefabPlacements(false);
     this.scene.remove(this.island);
+    this.currentIslandOutline = [];
     const disposedMaterials = new Set<THREE.Material>();
     this.island.traverse((object) => {
       const renderable = object as THREE.Object3D & {
@@ -2231,8 +3995,12 @@ export class SceneController {
 
   private readonly tick = (): void => {
     this.animationId = requestAnimationFrame(this.tick);
+    const now = performance.now();
+    const deltaSeconds = Math.min(0.1, Math.max(0, (now - this.lastFrameTime) / 1000));
+    this.lastFrameTime = now;
     this.controls.update();
-    this.updateWaterAnimation(performance.now() * 0.001);
+    this.updateSimulation(deltaSeconds * this.simulationSpeed);
+    this.updateWaterAnimation(now * 0.001);
     this.renderer.render(this.scene, this.camera);
   };
 }
