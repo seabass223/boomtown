@@ -1,4 +1,8 @@
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import fireworksFactoryModelUrl from '../assets/models/fireworks_factory.glb?url';
+import plazaModelUrl from '../assets/models/plaza.glb?url';
+import waterTowerModelUrl from '../assets/models/water_tower.glb?url';
 import { box, cylinder, labelSprite } from './helpers';
 import { mat, palette } from './materials';
 
@@ -40,6 +44,18 @@ export type PrefabGridCell = {
 };
 
 export const PREFAB_GRID_CELL_SIZE = 0.55;
+const prefabModelLoader = new GLTFLoader();
+const prefabModelCache = new Map<string, Promise<THREE.Group>>();
+
+const PREFAB_MODEL_URLS: Partial<Record<PrefabBuildingKey, string>> = {
+  waterTower: waterTowerModelUrl,
+  fireworksFactory: fireworksFactoryModelUrl,
+  plaza: plazaModelUrl,
+};
+const HOUSE_MODEL_URLS = import.meta.glob<string>(
+  '../assets/models/house_*.glb',
+  { eager: true, query: '?url', import: 'default' },
+);
 
 export const PREFAB_BUILDINGS: readonly PrefabBuildingDefinition[] = [
   {
@@ -227,7 +243,10 @@ export function getPrefabRotationFromDegrees(degrees: number): PrefabRotation {
   return (THREE.MathUtils.euclideanModulo(Math.round(degrees / 45), 8) as PrefabRotation);
 }
 
-export function createPrefabBuilding(definition: PrefabBuildingDefinition): THREE.Group {
+export function createPrefabBuilding(
+  definition: PrefabBuildingDefinition,
+  houseOrdinal?: number,
+): THREE.Group {
   const group = new THREE.Group();
   const dimensions = getPrefabWorldDimensions(definition);
   const material = mat(definition.color);
@@ -239,11 +258,20 @@ export function createPrefabBuilding(definition: PrefabBuildingDefinition): THRE
   group.userData.dimensions = { ...definition.dimensions };
 
   group.add(box(dimensions.width, 0.08, dimensions.length, accentMaterial, 0, 0.04, 0));
+  const label = labelSprite(`${definition.label} ${definition.dimensions.width}x${definition.dimensions.length}x${definition.dimensions.height}`);
+  label.name = `${definition.label} label`;
+  label.position.set(0, dimensions.height + 0.45, dimensions.length * 0.38);
+  group.add(label);
 
   switch (definition.key) {
-    case 'waterTower':
-      addWaterTowerPrimitive(group, dimensions, material, accentMaterial, darkMaterial);
+    case 'waterTower': {
+      const fallback = new THREE.Group();
+      fallback.name = 'Water Tower primitive fallback';
+      addWaterTowerPrimitive(fallback, dimensions, material, accentMaterial, darkMaterial);
+      group.add(fallback);
+      void replaceFallbackWithModel(group, fallback, definition, label);
       break;
+    }
     case 'lumberMill':
       addBlockBuilding(group, dimensions, material, accentMaterial, 0.76);
       addStackedLogs(group, dimensions, darkMaterial);
@@ -251,26 +279,126 @@ export function createPrefabBuilding(definition: PrefabBuildingDefinition): THRE
     case 'launchPad':
       addLaunchPadPrimitive(group, dimensions, material, accentMaterial);
       break;
-    case 'house':
-      addHousePrimitive(group, dimensions, material, accentMaterial);
+    case 'house': {
+      const fallback = new THREE.Group();
+      fallback.name = 'House primitive fallback';
+      addHousePrimitive(fallback, dimensions, material, accentMaterial);
+      group.add(fallback);
+      void replaceFallbackWithModel(group, fallback, definition, label, houseOrdinal);
       break;
-    case 'fireworksFactory':
-      addBlockBuilding(group, dimensions, material, accentMaterial, 0.72);
-      group.add(box(dimensions.width * 0.26, dimensions.height * 0.58, dimensions.length * 0.28, accentMaterial, -dimensions.width * 0.28, dimensions.height * 0.56, 0));
+    }
+    case 'fireworksFactory': {
+      const fallback = new THREE.Group();
+      fallback.name = 'Fireworks Factory primitive fallback';
+      addBlockBuilding(fallback, dimensions, material, accentMaterial, 0.72);
+      fallback.add(box(dimensions.width * 0.26, dimensions.height * 0.58, dimensions.length * 0.28, accentMaterial, -dimensions.width * 0.28, dimensions.height * 0.56, 0));
+      group.add(fallback);
+      void replaceFallbackWithModel(group, fallback, definition, label);
       break;
+    }
     case 'quarry':
       addQuarryPrimitive(group, dimensions, material, accentMaterial);
       break;
-    case 'plaza':
-      addPlazaPrimitive(group, dimensions, material, accentMaterial);
+    case 'plaza': {
+      const fallback = new THREE.Group();
+      fallback.name = 'Plaza primitive fallback';
+      addPlazaPrimitive(fallback, dimensions, material, accentMaterial);
+      group.add(fallback);
+      void replaceFallbackWithModel(group, fallback, definition, label);
       break;
+    }
   }
 
-  const label = labelSprite(`${definition.label} ${definition.dimensions.width}x${definition.dimensions.length}x${definition.dimensions.height}`);
-  label.position.set(0, dimensions.height + 0.45, dimensions.length * 0.38);
-  group.add(label);
-
   return group;
+}
+
+function getPrefabModel(url: string): Promise<THREE.Group> {
+  let model = prefabModelCache.get(url);
+  if (!model) {
+    model = prefabModelLoader.loadAsync(url).then((gltf) => gltf.scene);
+    prefabModelCache.set(url, model);
+  }
+  return model;
+}
+
+function cloneModelForPrefab(source: THREE.Group): THREE.Group {
+  const clone = source.clone(true);
+  clone.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh) {
+      return;
+    }
+    mesh.geometry = mesh.geometry.clone();
+    mesh.material = Array.isArray(mesh.material)
+      ? mesh.material.map((material) => material.clone())
+      : mesh.material.clone();
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+  });
+  return clone;
+}
+
+function disposeDetachedObject(root: THREE.Object3D): void {
+  root.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    mesh.geometry?.dispose();
+    if (Array.isArray(mesh.material)) {
+      mesh.material.forEach((material) => material.dispose());
+    } else {
+      mesh.material?.dispose();
+    }
+  });
+}
+
+async function replaceFallbackWithModel(
+  prefab: THREE.Group,
+  fallback: THREE.Group,
+  definition: PrefabBuildingDefinition,
+  label: THREE.Sprite,
+  houseOrdinal?: number,
+): Promise<void> {
+  const url = definition.key === 'house' && houseOrdinal !== undefined
+    ? HOUSE_MODEL_URLS[`../assets/models/house_${houseOrdinal}.glb`]
+    : PREFAB_MODEL_URLS[definition.key];
+  if (!url) {
+    return;
+  }
+
+  try {
+    const source = await getPrefabModel(url);
+    const model = cloneModelForPrefab(source);
+    if (!prefab.parent) {
+      disposeDetachedObject(model);
+      return;
+    }
+
+    const sourceBounds = new THREE.Box3().setFromObject(model);
+    const sourceSize = sourceBounds.getSize(new THREE.Vector3());
+    const sourceCenter = sourceBounds.getCenter(new THREE.Vector3());
+    const dimensions = getPrefabWorldDimensions(definition);
+    const modelScaleMultiplier =
+      definition.key === 'plaza' || definition.key === 'house' ? 3 : 2;
+    const scale = Math.min(
+      (dimensions.width * 0.94) / Math.max(0.001, sourceSize.x),
+      (dimensions.length * 0.94) / Math.max(0.001, sourceSize.z),
+    ) * modelScaleMultiplier;
+
+    model.name = `${definition.label} GLB model`;
+    model.scale.setScalar(scale);
+    model.position.set(
+      -sourceCenter.x * scale,
+      -sourceBounds.min.y * scale + 0.08,
+      -sourceCenter.z * scale,
+    );
+    model.userData.assetUrl = url;
+
+    fallback.removeFromParent();
+    disposeDetachedObject(fallback);
+    prefab.add(model);
+    label.position.y = sourceSize.y * scale + 0.53;
+  } catch (error) {
+    console.warn(`Could not load ${definition.label} model; keeping primitive fallback.`, error);
+  }
 }
 
 export function createPrefabPlacementPreview(

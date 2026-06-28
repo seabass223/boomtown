@@ -4,6 +4,7 @@ import {
   getSourceResources,
   type ResourceType,
 } from './economy.ts';
+import { GAME_RULES } from './gameRules.ts';
 
 export type { ResourceType } from './economy.ts';
 
@@ -22,7 +23,7 @@ export type WorkerLoop = {
 
 export type WorkerOrderAction = 'gather' | 'deliver' | 'return-home';
 
-export const WORKER_CARGO_CAPACITY = 3;
+export const WORKER_CARGO_CAPACITY = GAME_RULES.workers.cargoCapacity;
 
 export const RESOURCE_LABELS: Record<ResourceType, string> = {
   wood: 'wood',

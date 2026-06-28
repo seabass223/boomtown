@@ -131,7 +131,24 @@ test('reset creates a clean run after every mutable subsystem has changed', () =
   dirty.fireworks.produced = 8;
   dirty.fireworks.staged = 6;
   dirty.objective.minimumLaunchableFireworks = 5;
-  dirty.result = { success: true, launchableFireworks: 6 };
+  dirty.daySummaries.push({
+    day: 4,
+    discardedCargo: 2,
+    produced: 8,
+    staged: 6,
+    launchCapacity: 12,
+  });
+  dirty.result = {
+    success: true,
+    produced: 8,
+    staged: 6,
+    capacity: 12,
+    launched: 6,
+    wasted: 2,
+    grade: 'C',
+    reaction: 'Cheering',
+    failureReason: null,
+  };
 
   const restarted = resetBoomtownRunState();
   assert.deepEqual(restarted, resetBoomtownRunState());

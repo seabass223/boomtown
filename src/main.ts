@@ -12,6 +12,7 @@ const scene = new SceneController(canvas);
 const dayModal = document.querySelector<HTMLElement>('.day-modal');
 const dayModalButton = document.querySelector<HTMLButtonElement>('.day-modal__button');
 const simulationSpeedButton = document.querySelector<HTMLButtonElement>('.simulation-hud__speed');
+const simulationPauseButton = document.querySelector<HTMLButtonElement>('.simulation-hud__pause');
 
 toolbar?.addEventListener('click', (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-mode]');
@@ -49,6 +50,10 @@ dayModalButton?.addEventListener('click', () => {
 
 simulationSpeedButton?.addEventListener('click', () => {
   scene.cycleSimulationSpeed();
+});
+
+simulationPauseButton?.addEventListener('click', () => {
+  scene.toggleSimulationPause();
 });
 
 scene.start();

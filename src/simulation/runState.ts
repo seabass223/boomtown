@@ -6,6 +6,27 @@ import {
 import type { WorkerLoop, WorkerOrderAction, WorkerTaskState } from './workerLogistics.ts';
 
 export type SimulationSpeed = 1 | 2 | 4 | 8;
+export type PauseReason = 'player' | 'day-end' | null;
+
+export type DaySummary = {
+  day: number;
+  discardedCargo: number;
+  produced: number;
+  staged: number;
+  launchCapacity: number;
+};
+
+export type RunResult = {
+  success: boolean;
+  produced: number;
+  staged: number;
+  capacity: number;
+  launched: number;
+  wasted: number;
+  grade: string;
+  reaction: string;
+  failureReason: string | null;
+};
 
 export type WorkerRunState = {
   id: string;
@@ -33,6 +54,7 @@ export type BoomtownRunState = {
     clockMinutes: number;
     running: boolean;
     paused: boolean;
+    pauseReason: PauseReason;
     returnStarted: boolean;
     speed: SimulationSpeed;
   };
@@ -51,10 +73,8 @@ export type BoomtownRunState = {
   objective: {
     minimumLaunchableFireworks: number;
   };
-  result: null | {
-    success: boolean;
-    launchableFireworks: number;
-  };
+  daySummaries: DaySummary[];
+  result: RunResult | null;
 };
 
 export function createWorkerRunState(id: string): WorkerRunState {
@@ -88,6 +108,7 @@ export function createBoomtownRunState(): BoomtownRunState {
       clockMinutes: 0,
       running: false,
       paused: false,
+      pauseReason: null,
       returnStarted: false,
       speed: 1,
     },
@@ -106,6 +127,7 @@ export function createBoomtownRunState(): BoomtownRunState {
     objective: {
       minimumLaunchableFireworks: 0,
     },
+    daySummaries: [],
     result: null,
   };
 }

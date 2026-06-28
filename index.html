@@ -36,7 +36,14 @@
       <section class="simulation-hud" aria-live="polite" hidden>
         <span class="simulation-hud__date">July 1</span>
         <time class="simulation-hud__clock">8:00 AM</time>
+        <button class="simulation-hud__pause" type="button" aria-label="Pause simulation" aria-pressed="false">Ⅱ</button>
         <button class="simulation-hud__speed" type="button" aria-label="Simulation speed">1×</button>
+      </section>
+      <section class="simulation-objective-panel" aria-live="polite" hidden>
+        <strong>Objective: Build the Launch Field and maximize launchable fireworks by July 4, 8:00 PM</strong>
+        <span class="simulation-objective-panel__state">Launch Field: Not built · Capacity: 0</span>
+        <span class="simulation-objective-panel__counts">Staged: 0 · Launchable: 0 / 12 minimum</span>
+        <span class="simulation-objective-panel__deadline">4d remaining</span>
       </section>
       <section class="simulation-worker-panel" aria-live="polite" hidden>
         <strong class="simulation-worker-panel__summary">0 workers · none selected</strong>
@@ -52,6 +59,15 @@
         <span class="simulation-building-panel__metrics"></span>
       </section>
       <div class="simulation-notice" role="status" hidden></div>
+      <div class="simulation-effects" aria-hidden="true"></div>
+      <aside class="simulation-building-tooltip" role="tooltip" hidden>
+        <strong class="simulation-building-tooltip__title"></strong>
+        <span class="simulation-building-tooltip__metrics"></span>
+        <div class="simulation-building-tooltip__track" aria-hidden="true">
+          <span class="simulation-building-tooltip__fill"></span>
+        </div>
+        <span class="simulation-building-tooltip__progress"></span>
+      </aside>
       <div class="selection-marquee" hidden></div>
       <div class="day-modal" role="dialog" aria-modal="true" aria-labelledby="day-modal-title" hidden>
         <div class="day-modal__panel">
