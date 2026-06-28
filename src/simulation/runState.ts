@@ -11,9 +11,13 @@ export type PauseReason = 'player' | 'day-end' | null;
 export type DaySummary = {
   day: number;
   discardedCargo: number;
+  gathered: ResourceInventory;
+  delivered: ResourceInventory;
   produced: number;
   staged: number;
   launchCapacity: number;
+  launchFieldProgress: number;
+  launchRacks: number;
 };
 
 export type RunResult = {
@@ -73,6 +77,11 @@ export type BoomtownRunState = {
   objective: {
     minimumLaunchableFireworks: number;
   };
+  daily: {
+    gathered: ResourceInventory;
+    delivered: ResourceInventory;
+    produced: number;
+  };
   daySummaries: DaySummary[];
   result: RunResult | null;
 };
@@ -126,6 +135,11 @@ export function createBoomtownRunState(): BoomtownRunState {
     },
     objective: {
       minimumLaunchableFireworks: 0,
+    },
+    daily: {
+      gathered: createEmptyInventory(),
+      delivered: createEmptyInventory(),
+      produced: 0,
     },
     daySummaries: [],
     result: null,

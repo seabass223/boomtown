@@ -207,6 +207,66 @@ body {
   text-align: center;
 }
 
+.simulation-worker-panel__idle {
+  justify-self: center;
+  margin-top: 3px;
+  padding: 4px 10px;
+  border: 1px solid rgba(244, 209, 122, 0.48);
+  border-radius: 999px;
+  color: #25343a;
+  background: #f4d17a;
+  font: 750 10px/1 inherit;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.simulation-worker-panel__idle:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.simulation-worker-panel[data-condition="full"] {
+  border-color: rgba(239, 176, 71, 0.8);
+}
+
+.simulation-worker-panel[data-condition="returning"] {
+  border-color: rgba(151, 165, 174, 0.72);
+}
+
+.simulation-resource-hud {
+  position: fixed;
+  z-index: 18;
+  top: 62px;
+  left: 18px;
+  display: flex;
+  max-width: calc(50vw - 180px);
+  flex-wrap: wrap;
+  gap: 5px;
+  color: #fff;
+  pointer-events: none;
+}
+
+.simulation-resource-hud > span,
+.simulation-resource-hud > small {
+  padding: 5px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 7px;
+  background: rgba(28, 37, 43, 0.86);
+  box-shadow: 0 3px 10px rgba(13, 28, 35, 0.18);
+  backdrop-filter: blur(7px);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.simulation-resource-hud strong {
+  color: #f4d17a;
+  font-variant-numeric: tabular-nums;
+}
+
+.simulation-resource-hud > small {
+  color: #cbd7d9;
+}
+
 .simulation-building-panel {
   position: fixed;
   z-index: 18;
@@ -417,6 +477,21 @@ body {
   text-align: center;
 }
 
+.day-modal__metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  margin: 0 0 20px;
+}
+
+.day-modal__metrics span {
+  padding: 7px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.07);
+  color: #dce5e5;
+  font-size: 11px;
+}
+
 .day-modal__panel h2 {
   margin: 0 0 20px;
   font-size: 22px;
@@ -442,6 +517,73 @@ body {
 
 .day-modal__button:hover {
   background: #ffe39a;
+}
+
+.simulation-onboarding {
+  position: fixed;
+  z-index: 45;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(13, 23, 29, 0.52);
+  backdrop-filter: blur(4px);
+}
+
+.simulation-onboarding__panel {
+  width: min(510px, 100%);
+  padding: 24px;
+  border: 1px solid rgba(244, 209, 122, 0.56);
+  border-radius: 13px;
+  color: #fff;
+  background: #26363c;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.34);
+}
+
+.simulation-onboarding h2 {
+  margin: 0 0 16px;
+  color: #f4d17a;
+}
+
+.simulation-onboarding__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  margin-bottom: 18px;
+  font-size: 12px;
+}
+
+.simulation-onboarding kbd {
+  padding: 2px 5px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.09);
+  font: 700 10px/1 inherit;
+}
+
+.simulation-onboarding__dismiss {
+  padding: 8px 18px;
+  border: 0;
+  border-radius: 7px;
+  color: #25343a;
+  background: #f4d17a;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+@media (max-width: 900px) {
+  .simulation-resource-hud {
+    top: 105px;
+    max-width: calc(100vw - 36px);
+  }
+
+  .simulation-objective-panel {
+    top: 180px;
+  }
+
+  .simulation-building-panel {
+    top: 180px;
+  }
 }
 
 [hidden] {

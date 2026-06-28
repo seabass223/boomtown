@@ -37,6 +37,7 @@ import {
   LAUNCH_RACK_SLOTS,
   RESOURCE_TYPES,
   addResource,
+  createEmptyInventory,
   getAcceptedResources,
   getSourceResources,
   inventoryToResourceList,
@@ -56,6 +57,12 @@ import { runFixedSimulationSteps } from '../simulation/fixedStep.ts';
 import { GAME_RULES } from '../simulation/gameRules.ts';
 import { resolveRunResult } from '../simulation/scoring.ts';
 import { resolveCrowdOverlaps } from '../simulation/crowdAvoidance.ts';
+import {
+  createBurstDirections,
+  createFireworksShowPlan,
+  type FireworkBurstPlan,
+  type FireworksShowPlan,
+} from '../simulation/fireworksEngine.ts';
 import {
   createBoomtownRunState,
   createWorkerRunState,
@@ -259,6 +266,23 @@ type SimulationWorker = {
 type GrassTexturePathOverlay = {
   bounds: THREE.Box2;
   graph: WalkwayPathGraph | null;
+};
+
+type ActiveFireworkBurst = {
+  points: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
+  plan: FireworkBurstPlan;
+  directions: Array<[number, number, number]>;
+  startedAtSeconds: number;
+};
+
+type FireworksFinaleState = {
+  plan: FireworksShowPlan;
+  startedAtSeconds: number;
+  nextBurstIndex: number;
+  origin: THREE.Vector3;
+  bursts: ActiveFireworkBurst[];
+  cameraPosition: THREE.Vector3;
+  cameraTarget: THREE.Vector3;
 };
 
 const MIN_DRAW_POINT_DISTANCE = 0.08;
@@ -1709,12 +1733,12 @@ function createRockGeometryVariant(type: RockVariantType, detail: number): THREE
 }
 
 function createRockMaterialPalette(settings: IslandSettings): THREE.MeshStandardMaterial[] {
-  const base = new THREE.Color(0xd5a773);
+  const base = new THREE.Color(0xd4a672);
   const accents = [
-    new THREE.Color(0xe8bf87),
-    new THREE.Color(0xc8945f),
-    new THREE.Color(0xb77f4e),
-    new THREE.Color(0xdfb27d),
+    new THREE.Color(0x9a7e68),
+    new THREE.Color(0x8a7d78),
+    new THREE.Color(0xae8969),
+    new THREE.Color(0xe9b97d),
   ];
 
   return accents.map((accent, index) => {
@@ -1976,6 +2000,10 @@ export class SceneController {
   private hoveredSimulationBuildingIndex: number | null = null;
   private readonly simulationTooltipPointer = new THREE.Vector2();
   private readonly simulationBuildingVisuals = new Map<number, THREE.Group>();
+  private readonly validTargetHelpers: THREE.BoxHelper[] = [];
+  private readonly orderConfirmations: Array<{ root: THREE.Object3D; clearAt: number }> = [];
+  private readonly fireworksLayer = new THREE.Group();
+  private fireworksFinale: FireworksFinaleState | null = null;
   private lastFrameTime = performance.now();
   private readonly resizeObserver: ResizeObserver;
 
@@ -2000,7 +2028,9 @@ export class SceneController {
     this.prefabLayer.name = 'Placed prefab buildings';
     this.walkwayLayer.name = 'Procedural walking pathways';
     this.simulationLayer.name = 'Simulation workers';
+    this.fireworksLayer.name = 'Procedural fireworks finale';
     this.scene.add(this.simulationLayer);
+    this.scene.add(this.fireworksLayer);
 
     this.controls = new OrbitControls(this.camera, this.canvas);
     this.controls.enableDamping = true;
@@ -2067,12 +2097,49 @@ export class SceneController {
     this.runState.clock.returnStarted = false;
     this.runState.clock.paused = false;
     this.runState.clock.pauseReason = null;
+    this.runState.daily.gathered = createEmptyInventory();
+    this.runState.daily.delivered = createEmptyInventory();
+    this.runState.daily.produced = 0;
     this.simulationAccumulatorSeconds = 0;
     this.clearSimulationWorkers();
     this.spawnSimulationWorkers();
     this.updateSimulationHud();
     this.updateSimulationPauseButton();
     this.showSimulationNotice(`July ${this.runState.clock.day}: assign fresh duties for the new workday.`);
+  }
+
+  public handleDayModalAction(): void {
+    if (this.runState.clock.day >= SIMULATION_FINAL_DAY) {
+      this.startSimulation();
+      return;
+    }
+    this.continueSimulation();
+  }
+
+  public selectIdleWorkers(): void {
+    if (this.runState.clock.returnStarted || this.fireworksFinale) {
+      return;
+    }
+    const idleWorkers = this.simulationWorkers.filter(
+      (worker) => worker.state.taskState === 'idle' && worker.state.cargo.length < WORKER_CARGO_CAPACITY,
+    );
+    this.simulationWorkers.forEach((worker) => this.setWorkerSelected(worker, idleWorkers.includes(worker)));
+    this.showSimulationNotice(
+      idleWorkers.length > 0
+        ? `${idleWorkers.length} idle worker${idleWorkers.length === 1 ? '' : 's'} selected.`
+        : 'No truly idle workers available.',
+    );
+  }
+
+  public dismissOnboarding(): void {
+    document.querySelector<HTMLElement>('.simulation-onboarding')?.setAttribute('hidden', '');
+    window.localStorage.setItem('boomtown-onboarding-seen', '1');
+    if (this.runState.clock.pauseReason === 'player') {
+      this.runState.clock.paused = false;
+      this.runState.clock.pauseReason = null;
+      this.updateSimulationPauseButton();
+    }
+    this.canvas.focus();
   }
 
   public cycleSimulationSpeed(): void {
@@ -2136,14 +2203,27 @@ export class SceneController {
     document.querySelector<HTMLElement>('.simulation-worker-panel')?.removeAttribute('hidden');
     document.querySelector<HTMLElement>('.simulation-building-panel')?.removeAttribute('hidden');
     document.querySelector<HTMLElement>('.simulation-objective-panel')?.removeAttribute('hidden');
+    document.querySelector<HTMLElement>('.simulation-resource-hud')?.removeAttribute('hidden');
     document.querySelector<HTMLElement>('.day-modal')?.setAttribute('hidden', '');
     this.updateSimulationWorkerPanel();
     this.updateSimulationBuildingPanel();
+    this.updateResourceHud();
+    const onboarding = document.querySelector<HTMLElement>('.simulation-onboarding');
+    if (window.localStorage.getItem('boomtown-onboarding-seen') !== '1') {
+      this.runState.clock.paused = true;
+      this.runState.clock.pauseReason = 'player';
+      this.updateSimulationPauseButton();
+      onboarding?.removeAttribute('hidden');
+      document.querySelector<HTMLButtonElement>('.simulation-onboarding__dismiss')?.focus();
+    } else {
+      onboarding?.setAttribute('hidden', '');
+    }
     this.canvas.dispatchEvent(new CustomEvent('simulation-state-change'));
     this.showSimulationNotice('Select workers, then click a resource building to gather.');
   }
 
   private stopSimulation(): void {
+    this.stopFireworksFinale();
     this.runState.clock.running = false;
     this.runState.clock.paused = false;
     this.runState.clock.pauseReason = null;
@@ -2153,6 +2233,8 @@ export class SceneController {
     this.simulationMarqueeAdditive = false;
     this.clearSimulationWorkers();
     this.clearSimulationBuildingVisuals();
+    this.clearValidTargetHighlights();
+    this.clearOrderConfirmations();
     this.runState.buildings.clear();
     this.selectedSimulationBuildingIndex = null;
     delete this.canvas.dataset.simulationActive;
@@ -2161,6 +2243,8 @@ export class SceneController {
     document.querySelector<HTMLElement>('.simulation-worker-panel')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.simulation-building-panel')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.simulation-objective-panel')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.simulation-resource-hud')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.simulation-onboarding')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.simulation-notice')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.simulation-building-tooltip')?.setAttribute('hidden', '');
     document.querySelector<HTMLElement>('.simulation-effects')?.replaceChildren();
@@ -2256,18 +2340,18 @@ export class SceneController {
       const progress = prefab.key === 'launchPad'
         ? this.runState.construction.launchFieldComplete
           ? getConstructionFraction(
-              this.runState.construction.launchRackProgress,
-              ECONOMY_RECIPES['launch-rack'].inputs,
-            )
+            this.runState.construction.launchRackProgress,
+            ECONOMY_RECIPES['launch-rack'].inputs,
+          )
           : getConstructionFraction(
-              this.runState.construction.launchFieldProgress,
-              ECONOMY_RECIPES['launch-field'].inputs,
-            )
+            this.runState.construction.launchFieldProgress,
+            ECONOMY_RECIPES['launch-field'].inputs,
+          )
         : Math.min(
-            1,
-            (building?.productionProgressSeconds ?? 0) /
-              ECONOMY_RECIPES.fireworks.durationSeconds,
-          );
+          1,
+          (building?.productionProgressSeconds ?? 0) /
+          ECONOMY_RECIPES.fireworks.durationSeconds,
+        );
       fill.scale.x = Math.max(0.001, progress);
       fill.position.x = -0.59 + (1.18 * progress) / 2;
 
@@ -2520,6 +2604,14 @@ export class SceneController {
     if (!prefab) {
       return 'invalid';
     }
+    if (
+      prefab.key === 'launchPad' &&
+      !this.runState.construction.launchFieldComplete &&
+      worker.state.cargo.includes('fireworks') &&
+      !worker.state.cargo.some((resource) => resource === 'wood' || resource === 'stone')
+    ) {
+      return 'invalid';
+    }
 
     if (acceptsAnyCargo(prefab.key, worker.state.cargo)) {
       return this.beginWorkerOrder(worker, buildingIndex, 'deliver') ? 'deliver' : 'invalid';
@@ -2541,11 +2633,22 @@ export class SceneController {
 
     const label = this.getBuildingLabel(buildingIndex);
     if (gathering > 0) {
+      this.showOrderConfirmation(workers, buildingIndex);
       this.showSimulationNotice(`${gathering} worker${gathering === 1 ? '' : 's'} gathering at ${label}.`);
     } else if (delivering > 0) {
+      this.showOrderConfirmation(workers, buildingIndex);
       this.showSimulationNotice(`${delivering} worker${delivering === 1 ? '' : 's'} delivering to ${label}.`);
     } else {
-      this.showSimulationNotice(`No selected worker can gather from or deliver to ${label}.`);
+      const prefab = this.placedPrefabs[buildingIndex];
+      const prematureFireworks =
+        prefab?.key === 'launchPad' &&
+        !this.runState.construction.launchFieldComplete &&
+        workers.some((worker) => worker.state.cargo.includes('fireworks'));
+      this.showSimulationNotice(
+        prematureFireworks
+          ? 'Launch Field incomplete: finish wood and stone construction first.'
+          : `No compatible or reachable order for ${label}.`,
+      );
     }
   }
 
@@ -2595,6 +2698,7 @@ export class SceneController {
 
     this.updateSimulationWorkerPanel();
     if (created > 0) {
+      this.showOrderConfirmation(workers, buildingIndex);
       this.showSimulationNotice(
         `${created} harvest loop${created === 1 ? '' : 's'} assigned to ${this.getBuildingLabel(buildingIndex)}.`,
       );
@@ -2613,21 +2717,24 @@ export class SceneController {
     const cargoInventory = resourceListToInventory(worker.state.cargo);
     const transferredAmounts = prefab.key === 'launchPad'
       ? deliverToLaunchField(
-          this.runState,
-          cargoInventory,
-          getRunBuildingInventory(this.runState, buildingIndex, 'input'),
-        ).transferred
+        this.runState,
+        cargoInventory,
+        getRunBuildingInventory(this.runState, buildingIndex, 'input'),
+      ).transferred
       : transferAcceptedResources(
-          cargoInventory,
-          getRunBuildingInventory(this.runState, buildingIndex, 'input'),
-          getAcceptedResources(prefab.key),
-        );
+        cargoInventory,
+        getRunBuildingInventory(this.runState, buildingIndex, 'input'),
+        getAcceptedResources(prefab.key),
+      );
     const transferred = inventoryToResourceList({
       wood: transferredAmounts.wood ?? 0,
       water: transferredAmounts.water ?? 0,
       ore: transferredAmounts.ore ?? 0,
       stone: transferredAmounts.stone ?? 0,
       fireworks: transferredAmounts.fireworks ?? 0,
+    });
+    RESOURCE_TYPES.forEach((resource) => {
+      addResource(this.runState.daily.delivered, resource, transferredAmounts[resource] ?? 0);
     });
     this.showResourceDeliveryPopups(buildingIndex, transferredAmounts);
     worker.state.cargo = inventoryToResourceList(cargoInventory);
@@ -2643,6 +2750,7 @@ export class SceneController {
     this.updateSimulationBuildingPanel();
     this.updateSimulationObjectivePanel();
     this.refreshSimulationBuildingTooltip();
+    this.updateValidTargetHighlights();
   }
 
   private finishWorkerOrder(worker: SimulationWorker): void {
@@ -2650,6 +2758,107 @@ export class SceneController {
     worker.state.targetBuildingIndex = null;
     worker.state.taskProgressSeconds = 0;
     this.setWorkerTaskState(worker, 'idle');
+  }
+
+  private clearValidTargetHighlights(): void {
+    this.validTargetHelpers.splice(0).forEach((helper) => {
+      helper.removeFromParent();
+      helper.geometry.dispose();
+      helper.material.dispose();
+    });
+  }
+
+  private updateValidTargetHighlights(): void {
+    this.clearValidTargetHighlights();
+    if (!this.runState.clock.running || this.runState.clock.returnStarted) {
+      return;
+    }
+    const selectedWorkers = this.simulationWorkers.filter((worker) => worker.selected);
+    if (selectedWorkers.length === 0) {
+      return;
+    }
+    this.placedPrefabs.forEach((prefab, buildingIndex) => {
+      const valid = selectedWorkers.some(
+        (worker) => {
+          const launchBlocked =
+            prefab.key === 'launchPad' &&
+            !this.runState.construction.launchFieldComplete &&
+            worker.state.cargo.includes('fireworks') &&
+            !worker.state.cargo.some((resource) => resource === 'wood' || resource === 'stone');
+          return !launchBlocked && (
+            acceptsAnyCargo(prefab.key, worker.state.cargo) ||
+            this.canGatherAtBuilding(worker, buildingIndex)
+          );
+        },
+      );
+      if (!valid) {
+        return;
+      }
+      const helper = new THREE.BoxHelper(prefab.group, 0x74e58c);
+      helper.name = 'Valid worker target';
+      this.scene.add(helper);
+      this.validTargetHelpers.push(helper);
+    });
+  }
+
+  private showOrderConfirmation(workers: SimulationWorker[], buildingIndex: number): void {
+    const prefab = this.placedPrefabs[buildingIndex];
+    if (!prefab) {
+      return;
+    }
+    const root = new THREE.Group();
+    root.name = 'Worker order confirmation';
+    const definition = getPrefabDefinition(prefab.key);
+    const center = getPrefabWorldCenter(definition, prefab.placement);
+    const y = this.settings.rockHeight + 0.12;
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(0.28, 0.36, 24),
+      new THREE.MeshBasicMaterial({
+        color: 0x74e58c,
+        transparent: true,
+        opacity: 0.9,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      }),
+    );
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(center.x, y, center.y);
+    root.add(ring);
+    workers.slice(0, 8).forEach((worker) => {
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(worker.mesh.position.x, y, worker.mesh.position.z),
+          new THREE.Vector3(center.x, y, center.y),
+        ]),
+        new THREE.LineBasicMaterial({ color: 0x74e58c, transparent: true, opacity: 0.55 }),
+      );
+      root.add(line);
+    });
+    this.scene.add(root);
+    this.orderConfirmations.push({ root, clearAt: performance.now() + 900 });
+  }
+
+  private clearOrderConfirmations(now = Number.POSITIVE_INFINITY): void {
+    for (let index = this.orderConfirmations.length - 1; index >= 0; index -= 1) {
+      const confirmation = this.orderConfirmations[index];
+      if (confirmation.clearAt > now) {
+        continue;
+      }
+      confirmation.root.traverse((object) => {
+        const renderable = object as THREE.Object3D & {
+          geometry?: THREE.BufferGeometry;
+          material?: THREE.Material | THREE.Material[];
+        };
+        renderable.geometry?.dispose();
+        if (Array.isArray(renderable.material)) {
+          renderable.material.forEach((material) => material.dispose());
+        } else {
+          renderable.material?.dispose();
+        }
+      });
+      confirmation.root.removeFromParent();
+      this.orderConfirmations.splice(index, 1);
+    }
   }
 
   private continueWorkerLoopAfterDelivery(worker: SimulationWorker): void {
@@ -2718,9 +2927,16 @@ export class SceneController {
     this.runState.daySummaries.push({
       day: this.runState.clock.day,
       discardedCargo: discardedResources,
-      produced: this.runState.fireworks.produced,
+      gathered: { ...this.runState.daily.gathered },
+      delivered: { ...this.runState.daily.delivered },
+      produced: this.runState.daily.produced,
       staged: this.runState.fireworks.staged,
       launchCapacity: getLaunchCapacity(this.runState),
+      launchFieldProgress: getConstructionFraction(
+        this.runState.construction.launchFieldProgress,
+        ECONOMY_RECIPES['launch-field'].inputs,
+      ),
+      launchRacks: this.runState.construction.launchRacks,
     });
     this.updateSimulationWorkerPanel();
     this.showSimulationNotice(
@@ -2809,6 +3025,7 @@ export class SceneController {
       );
       if (produced > 0) {
         this.runState.fireworks.produced += produced;
+        this.runState.daily.produced += produced;
       }
     });
     this.updateSimulationBuildingVisuals();
@@ -2952,6 +3169,7 @@ export class SceneController {
       }
 
       worker.state.cargo.push(resource);
+      addResource(this.runState.daily.gathered, resource, 1);
       worker.state.taskProgressSeconds -= SIMULATION_GATHER_SECONDS;
       if (prefab.key === 'quarry' && !worker.state.loop) {
         worker.state.quarryFallback = worker.state.quarryFallback === 'ore' ? 'stone' : 'ore';
@@ -2968,6 +3186,7 @@ export class SceneController {
     } else {
       const gathered = summarizeResources(worker.state.cargo);
       this.finishWorkerOrder(worker);
+      this.updateValidTargetHighlights();
       this.showSimulationNotice(`Worker load full: ${gathered}. Select a destination.`);
     }
   }
@@ -3037,6 +3256,50 @@ export class SceneController {
       `${days > 0 ? `${days}d ` : ''}${hours}h ${minutes.toString().padStart(2, '0')}m remaining`;
   }
 
+  private updateResourceHud(): void {
+    const stored = createEmptyInventory();
+    this.runState.buildings.forEach((building) => {
+      RESOURCE_TYPES.forEach((resource) => {
+        stored[resource] += building.input[resource] + building.output[resource];
+      });
+    });
+    for (const progress of [
+      this.runState.construction.launchFieldProgress,
+      this.runState.construction.launchRackProgress,
+    ]) {
+      RESOURCE_TYPES.forEach((resource) => {
+        stored[resource] += progress[resource];
+      });
+    }
+    const cargo = this.simulationWorkers.flatMap((worker) => worker.state.cargo);
+    const values: Record<string, number> = {
+      wood: stored.wood,
+      water: stored.water,
+      ore: stored.ore,
+      stone: stored.stone,
+      fireworks: this.runState.fireworks.produced,
+      staged: this.runState.fireworks.staged,
+      launchable: getLaunchableFireworks(this.runState),
+    };
+    Object.entries(values).forEach(([resource, value]) => {
+      const element = document.querySelector<HTMLElement>(
+        `.simulation-resource-hud [data-resource="${resource}"] strong`,
+      );
+      if (element) {
+        element.textContent = String(value);
+      }
+    });
+    const cargoElement = document.querySelector<HTMLElement>('.simulation-resource-hud__cargo');
+    const capacityElement = document.querySelector<HTMLElement>('.simulation-resource-hud__capacity');
+    if (cargoElement) {
+      cargoElement.textContent = `In transit: ${cargo.length} (${summarizeResources(cargo)})`;
+    }
+    if (capacityElement) {
+      capacityElement.textContent =
+        `Capacity ${getLaunchCapacity(this.runState)} · Minimum ${this.runState.objective.minimumLaunchableFireworks}`;
+    }
+  }
+
   private finishSimulationDay(): void {
     this.runState.clock.paused = true;
     this.runState.clock.pauseReason = 'day-end';
@@ -3044,10 +3307,21 @@ export class SceneController {
     this.simulationWorkers.forEach((worker) => this.setWorkerSelected(worker, false));
     if (this.runState.clock.day >= SIMULATION_FINAL_DAY) {
       this.runState.result = resolveRunResult(this.runState);
+      this.startFireworksFinale(this.runState.result.launched);
+      return;
     }
+    this.showDayResultModal();
+  }
+
+  private showDayResultModal(): void {
     const modal = document.querySelector<HTMLElement>('.day-modal');
     const title = document.querySelector<HTMLElement>('#day-modal-title');
     const summary = document.querySelector<HTMLElement>('.day-modal__summary');
+    const metrics = document.querySelector<HTMLElement>('.day-modal__metrics');
+    const button = document.querySelector<HTMLButtonElement>('.day-modal__button');
+    const daySummary = this.runState.daySummaries.find(
+      (entry) => entry.day === this.runState.clock.day,
+    );
     if (title) {
       title.textContent = this.runState.result
         ? this.runState.result.success
@@ -3056,15 +3330,164 @@ export class SceneController {
         : "Today's progress";
     }
     if (summary) {
-      const daySummary = this.runState.daySummaries.find(
-        (entry) => entry.day === this.runState.clock.day,
-      );
       summary.textContent = this.runState.result
-        ? `${this.runState.result.reaction} Produced ${this.runState.result.produced} · staged ${this.runState.result.staged} · capacity ${this.runState.result.capacity} · launched ${this.runState.result.launched} · unlaunchable ${this.runState.result.wasted}.`
-        : `${this.runState.fireworks.produced} produced · ${this.runState.fireworks.staged} staged · ${getLaunchCapacity(this.runState)} capacity · ${daySummary?.discardedCargo ?? 0} cargo discarded at cutoff.`;
+        ? this.runState.result.reaction
+        : `July ${this.runState.clock.day} complete. Reassign everyone tomorrow morning.`;
+    }
+    if (metrics) {
+      const entries = this.runState.result
+        ? [
+          `Produced ${this.runState.result.produced}`,
+          `Staged ${this.runState.result.staged}`,
+          `Capacity ${this.runState.result.capacity}`,
+          `Launched ${this.runState.result.launched}`,
+          `Unlaunchable ${this.runState.result.wasted}`,
+          `Grade ${this.runState.result.grade}`,
+        ]
+        : [
+          `Gathered ${daySummary ? summarizeResources(inventoryToResourceList(daySummary.gathered)) : '0'}`,
+          `Delivered ${daySummary ? summarizeResources(inventoryToResourceList(daySummary.delivered)) : '0'}`,
+          `Produced ${daySummary?.produced ?? 0}`,
+          `Field ${Math.round((daySummary?.launchFieldProgress ?? 0) * 100)}%`,
+          `Racks ${daySummary?.launchRacks ?? 0} · staged ${daySummary?.staged ?? 0}`,
+          `Cargo wasted ${daySummary?.discardedCargo ?? 0}`,
+        ];
+      metrics.replaceChildren(...entries.map((text) => {
+        const element = document.createElement('span');
+        element.textContent = text;
+        return element;
+      }));
+    }
+    if (button) {
+      button.textContent = this.runState.result ? 'Restart' : 'Start Next Day';
     }
     modal?.removeAttribute('hidden');
-    document.querySelector<HTMLButtonElement>('.day-modal__button')?.focus();
+    button?.focus();
+  }
+
+  private startFireworksFinale(launchCount: number): void {
+    this.stopFireworksFinale();
+    const launchIndex = this.placedPrefabs.findIndex((prefab) => prefab.key === 'launchPad');
+    const launchPrefab = this.placedPrefabs[launchIndex];
+    const launchCenter = launchPrefab
+      ? getPrefabWorldCenter(getPrefabDefinition(launchPrefab.key), launchPrefab.placement)
+      : new THREE.Vector2();
+    this.fireworksFinale = {
+      plan: createFireworksShowPlan(launchCount, 40704),
+      startedAtSeconds: performance.now() / 1000,
+      nextBurstIndex: 0,
+      origin: new THREE.Vector3(launchCenter.x, this.settings.rockHeight, launchCenter.y),
+      bursts: [],
+      cameraPosition: this.camera.position.clone(),
+      cameraTarget: this.controls.target.clone(),
+    };
+    this.scene.background = new THREE.Color(0x071329);
+    this.scene.fog = new THREE.Fog(0x071329, 28, 64);
+    this.sunLight.intensity = 0.18;
+    this.ambientLight.intensity = 0.65;
+    this.rimLight.intensity = 0.35;
+    this.fillLight.intensity = 0.12;
+    this.controls.enabled = false;
+    this.controls.target.copy(this.fireworksFinale.origin).add(new THREE.Vector3(0, 3.5, 0));
+    this.camera.position.copy(this.fireworksFinale.origin).add(new THREE.Vector3(8, 7.5, 9));
+    this.camera.lookAt(this.controls.target);
+    document.querySelector<HTMLElement>('.simulation-worker-panel')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.simulation-building-panel')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.simulation-objective-panel')?.setAttribute('hidden', '');
+    document.querySelector<HTMLElement>('.simulation-resource-hud')?.setAttribute('hidden', '');
+    this.showSimulationNotice(
+      launchCount > 0 ? `${launchCount} fireworks launching!` : 'No fireworks were ready to launch.',
+    );
+  }
+
+  private spawnFireworkBurst(finale: FireworksFinaleState, plan: FireworkBurstPlan): void {
+    const directions = createBurstDirections(plan);
+    const positions = new Float32Array(plan.particleCount * 3);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const material = new THREE.PointsMaterial({
+      color: plan.color,
+      size: 0.09 * plan.size,
+      transparent: true,
+      opacity: 1,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      sizeAttenuation: true,
+    });
+    const points = new THREE.Points(geometry, material);
+    points.name = `Firework burst ${plan.index + 1}`;
+    this.fireworksLayer.add(points);
+    finale.bursts.push({
+      points,
+      plan,
+      directions,
+      startedAtSeconds: finale.startedAtSeconds + plan.launchAtSeconds,
+    });
+  }
+
+  private updateFireworksFinale(nowSeconds: number): void {
+    const finale = this.fireworksFinale;
+    if (!finale) {
+      return;
+    }
+    const elapsed = nowSeconds - finale.startedAtSeconds;
+    while (
+      finale.nextBurstIndex < finale.plan.bursts.length &&
+      finale.plan.bursts[finale.nextBurstIndex].launchAtSeconds <= elapsed
+    ) {
+      this.spawnFireworkBurst(finale, finale.plan.bursts[finale.nextBurstIndex]);
+      finale.nextBurstIndex += 1;
+    }
+    for (let index = finale.bursts.length - 1; index >= 0; index -= 1) {
+      const burst = finale.bursts[index];
+      const age = nowSeconds - burst.startedAtSeconds;
+      const progress = age / burst.plan.lifetimeSeconds;
+      if (progress >= 1) {
+        burst.points.removeFromParent();
+        burst.points.geometry.dispose();
+        burst.points.material.dispose();
+        finale.bursts.splice(index, 1);
+        continue;
+      }
+      const positions = burst.points.geometry.getAttribute('position') as THREE.BufferAttribute;
+      burst.directions.forEach((direction, particleIndex) => {
+        const speed = 2.1 * burst.plan.size;
+        positions.setXYZ(
+          particleIndex,
+          finale.origin.x + burst.plan.x + direction[0] * speed * age,
+          finale.origin.y + burst.plan.y + direction[1] * speed * age - 1.25 * age * age,
+          finale.origin.z + burst.plan.z + direction[2] * speed * age,
+        );
+      });
+      positions.needsUpdate = true;
+      burst.points.material.opacity = Math.max(0, 1 - progress * progress);
+    }
+    if (
+      elapsed >= finale.plan.durationSeconds + 1.5 &&
+      finale.bursts.length === 0
+    ) {
+      this.stopFireworksFinale();
+      this.showDayResultModal();
+    }
+  }
+
+  private stopFireworksFinale(): void {
+    const finale = this.fireworksFinale;
+    if (!finale) {
+      return;
+    }
+    finale.bursts.forEach((burst) => {
+      burst.points.removeFromParent();
+      burst.points.geometry.dispose();
+      burst.points.material.dispose();
+    });
+    this.fireworksLayer.clear();
+    this.camera.position.copy(finale.cameraPosition);
+    this.controls.target.copy(finale.cameraTarget);
+    this.camera.lookAt(this.controls.target);
+    this.fireworksFinale = null;
+    this.applyVibe();
+    this.controls.enabled = this.interactionMode === 'simulate';
   }
 
   private setWorkerSelected(worker: SimulationWorker, selected: boolean): void {
@@ -3072,15 +3495,26 @@ export class SceneController {
     worker.mesh.material.emissive.setHex(selected ? 0xf4d17a : 0x000000);
     worker.mesh.material.emissiveIntensity = selected ? 0.65 : 0;
     this.updateSimulationWorkerPanel();
+    this.updateValidTargetHighlights();
   }
 
   private updateSimulationWorkerPanel(): void {
     const panel = document.querySelector<HTMLElement>('.simulation-worker-panel');
     const summary = document.querySelector<HTMLElement>('.simulation-worker-panel__summary');
     const detail = document.querySelector<HTMLElement>('.simulation-worker-panel__detail');
-    if (!panel || !summary || !detail) {
+    const idleButton = document.querySelector<HTMLButtonElement>('.simulation-worker-panel__idle');
+    if (!panel || !summary || !detail || !idleButton) {
       return;
     }
+
+    const idleCount = this.simulationWorkers.filter(
+      (worker) => worker.state.taskState === 'idle' && worker.state.cargo.length < WORKER_CARGO_CAPACITY,
+    ).length;
+    const loadedCount = this.simulationWorkers.filter(
+      (worker) => worker.state.taskState === 'idle' && worker.state.cargo.length >= WORKER_CARGO_CAPACITY,
+    ).length;
+    idleButton.textContent = `Idle ${idleCount}${loadedCount > 0 ? ` · Loaded ${loadedCount}` : ''}`;
+    idleButton.disabled = idleCount === 0 || this.runState.clock.returnStarted || Boolean(this.fireworksFinale);
 
     const selectedWorkers = this.simulationWorkers.filter((worker) => worker.selected);
     panel.dataset.selectedCount = String(selectedWorkers.length);
@@ -3089,6 +3523,8 @@ export class SceneController {
       detail.textContent = this.runState.clock.returnStarted
         ? 'Returning home'
         : 'Click a worker or drag a box to select';
+      panel.dataset.condition = this.runState.clock.returnStarted ? 'returning' : 'idle';
+      this.updateResourceHud();
       return;
     }
 
@@ -3106,9 +3542,27 @@ export class SceneController {
     const activeLoops = selectedWorkers.filter((worker) => worker.state.loop !== null).length;
 
     summary.textContent = `${selectedWorkers.length} selected · cargo ${cargo.length}/${selectedWorkers.length * WORKER_CARGO_CAPACITY}`;
-    detail.textContent = pendingLoop
-      ? `${states} · choose Shift-loop destination`
-      : `${states} · ${summarizeResources(cargo)}${activeLoops > 0 ? ` · ${activeLoops} looping` : ''}`;
+    if (selectedWorkers.length === 1) {
+      const worker = selectedWorkers[0];
+      const destination = worker.state.targetBuildingIndex === null
+        ? 'none'
+        : this.getBuildingLabel(worker.state.targetBuildingIndex);
+      const loop = worker.state.loop
+        ? `${this.getBuildingLabel(worker.state.loop.sourceBuildingIndex)} → ${this.getBuildingLabel(worker.state.loop.destinationBuildingIndex)}`
+        : 'none';
+      detail.textContent =
+        `${worker.state.taskState.replace('-', ' ')} · ${summarizeResources(cargo)} · target ${destination} · loop ${loop}`;
+    } else {
+      detail.textContent = pendingLoop
+        ? `${states} · choose Shift-loop destination`
+        : `${states} · ${summarizeResources(cargo)}${activeLoops > 0 ? ` · ${activeLoops} looping` : ''}`;
+    }
+    panel.dataset.condition = selectedWorkers.some((worker) => worker.state.taskState === 'returning-home')
+      ? 'returning'
+      : selectedWorkers.some((worker) => worker.state.cargo.length >= WORKER_CARGO_CAPACITY)
+        ? 'full'
+        : 'active';
+    this.updateResourceHud();
   }
 
   private updateSimulationBuildingPanel(): void {
@@ -3141,7 +3595,7 @@ export class SceneController {
       detail.textContent = prefab.key === 'quarry'
         ? 'Shift-loop to Factory gathers ore; Shift-loop to Launch Field gathers stone. One-shot work alternates.'
         : `Workers gather ${sources} until their 3-slot cargo is full.`;
-      metrics.textContent = `Output: ${sources}`;
+      metrics.textContent = `Output: ${sources} · ${SIMULATION_GATHER_SECONDS.toFixed(1)}s/item`;
       progress.style.width = `${Math.min(100, building.activeWorkers * 25)}%`;
       return;
     }
@@ -3183,9 +3637,15 @@ export class SceneController {
 
     status.textContent = prefab.key === 'house' ? 'Worker home' : 'Town landmark';
     detail.textContent = prefab.key === 'house'
-      ? 'Two workers leave this house each morning.'
+      ? 'Two resident workers.'
       : 'No production role in the v1 economy.';
-    metrics.textContent = '';
+    if (prefab.key === 'house') {
+      const residents = this.simulationWorkers.filter((worker) => worker.homeBuildingIndex === buildingIndex);
+      const home = residents.filter((worker) => !worker.mesh.visible).length;
+      metrics.textContent = `${home} home · ${residents.length - home} away`;
+    } else {
+      metrics.textContent = '';
+    }
     progress.style.width = '0%';
   }
 
@@ -4799,6 +5259,12 @@ export class SceneController {
       return;
     }
 
+    if (this.interactionMode === 'simulate' && event.key.toLowerCase() === 'i') {
+      event.preventDefault();
+      this.selectIdleWorkers();
+      return;
+    }
+
     if (
       event.key.toLowerCase() === 'r' &&
       (this.prefabUi.placeMode || (this.prefabUi.editMode && this.selectedPlacedPrefab))
@@ -5087,6 +5553,8 @@ export class SceneController {
       this.simulationAccumulatorSeconds = 0;
     }
     this.updateSimulationNotice(now);
+    this.clearOrderConfirmations(now);
+    this.updateFireworksFinale(now * 0.001);
     this.updateWaterAnimation(now * 0.001);
     this.renderer.render(this.scene, this.camera);
   };

@@ -48,6 +48,18 @@
       <section class="simulation-worker-panel" aria-live="polite" hidden>
         <strong class="simulation-worker-panel__summary">0 workers · none selected</strong>
         <span class="simulation-worker-panel__detail">Click a worker or drag a box to select</span>
+        <button class="simulation-worker-panel__idle" type="button">Idle 0</button>
+      </section>
+      <section class="simulation-resource-hud" aria-label="Town resources" hidden>
+        <span data-resource="wood">🪵 Wood <strong>0</strong></span>
+        <span data-resource="water">💧 Water <strong>0</strong></span>
+        <span data-resource="ore">⛏ Ore <strong>0</strong></span>
+        <span data-resource="stone">◆ Stone <strong>0</strong></span>
+        <span data-resource="fireworks">✦ Made <strong>0</strong></span>
+        <span data-resource="staged">🚀 Staged <strong>0</strong></span>
+        <span data-resource="launchable">★ Ready <strong>0</strong></span>
+        <small class="simulation-resource-hud__cargo">In transit: 0</small>
+        <small class="simulation-resource-hud__capacity">Capacity 0 · Minimum 12</small>
       </section>
       <section class="simulation-building-panel" aria-live="polite" hidden>
         <strong class="simulation-building-panel__title">Town production</strong>
@@ -69,10 +81,27 @@
         <span class="simulation-building-tooltip__progress"></span>
       </aside>
       <div class="selection-marquee" hidden></div>
+      <section class="simulation-onboarding" role="dialog" aria-labelledby="onboarding-title" hidden>
+        <div class="simulation-onboarding__panel">
+          <h2 id="onboarding-title">Boomtown controls</h2>
+          <div class="simulation-onboarding__grid">
+            <span><kbd>Click</kbd> select worker</span>
+            <span><kbd>Drag</kbd> box select</span>
+            <span><kbd>Shift</kbd> add selection</span>
+            <span><kbd>Click building</kbd> assign</span>
+            <span><kbd>Shift + buildings</kbd> source → destination loop</span>
+            <span><kbd>Ⅱ</kbd> pause · inspect · queue</span>
+            <span><kbd>1×</kbd> cycle speed</span>
+            <span><kbd>I</kbd> select idle workers</span>
+          </div>
+          <button class="simulation-onboarding__dismiss" type="button">Got it</button>
+        </div>
+      </section>
       <div class="day-modal" role="dialog" aria-modal="true" aria-labelledby="day-modal-title" hidden>
         <div class="day-modal__panel">
           <h2 id="day-modal-title">Today's progress</h2>
           <p class="day-modal__summary"></p>
+          <div class="day-modal__metrics"></div>
           <button class="day-modal__button" type="button">OK</button>
         </div>
       </div>

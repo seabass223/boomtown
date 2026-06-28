@@ -134,9 +134,13 @@ test('reset creates a clean run after every mutable subsystem has changed', () =
   dirty.daySummaries.push({
     day: 4,
     discardedCargo: 2,
+    gathered: createEmptyInventory({ ore: 3 }),
+    delivered: createEmptyInventory({ ore: 3 }),
     produced: 8,
     staged: 6,
     launchCapacity: 12,
+    launchFieldProgress: 1,
+    launchRacks: 2,
   });
   dirty.result = {
     success: true,

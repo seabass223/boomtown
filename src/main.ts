@@ -13,6 +13,8 @@ const dayModal = document.querySelector<HTMLElement>('.day-modal');
 const dayModalButton = document.querySelector<HTMLButtonElement>('.day-modal__button');
 const simulationSpeedButton = document.querySelector<HTMLButtonElement>('.simulation-hud__speed');
 const simulationPauseButton = document.querySelector<HTMLButtonElement>('.simulation-hud__pause');
+const idleWorkerButton = document.querySelector<HTMLButtonElement>('.simulation-worker-panel__idle');
+const onboardingDismiss = document.querySelector<HTMLButtonElement>('.simulation-onboarding__dismiss');
 
 toolbar?.addEventListener('click', (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-mode]');
@@ -45,7 +47,7 @@ canvas.addEventListener('simulation-state-change', () => {
 
 dayModalButton?.addEventListener('click', () => {
   dayModal?.setAttribute('hidden', '');
-  scene.continueSimulation();
+  scene.handleDayModalAction();
 });
 
 simulationSpeedButton?.addEventListener('click', () => {
@@ -54,6 +56,14 @@ simulationSpeedButton?.addEventListener('click', () => {
 
 simulationPauseButton?.addEventListener('click', () => {
   scene.toggleSimulationPause();
+});
+
+idleWorkerButton?.addEventListener('click', () => {
+  scene.selectIdleWorkers();
+});
+
+onboardingDismiss?.addEventListener('click', () => {
+  scene.dismissOnboarding();
 });
 
 scene.start();
