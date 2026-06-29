@@ -23,7 +23,7 @@ Core resources and flow:
 - `Launch Field` must be built before any staged fireworks count.
 - `Launch racks` increase launch capacity in 6-firework increments.
 
-The current tuned balance lives in [docs/balance.md](/C:/repos/summer-into-ai/boomtown/docs/balance.md).
+The current tuned balance lives in [docs/balance.md](./docs/balance.md).
 
 ## Controls
 
