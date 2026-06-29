@@ -6,6 +6,7 @@ import type { NumberController } from 'three/examples/jsm/libs/lil-gui.module.mi
 import workerModelUrl from '../assets/models/worker.glb?url';
 import grassPainterlyUrl from '../assets/textures/grass-painterly.png?url';
 import { WorkerCharacterDriver } from './WorkerCharacterDriver';
+import { BUILTIN_PREFAB_ISLAND_PRESET_NAME, getBuiltinPrefabIslandPreset } from './prefabIslandPreset';
 import {
   PREFAB_BUILDING_LABELS,
   PREFAB_BUILDINGS,
@@ -4364,6 +4365,11 @@ export class SceneController {
     this.applyProceduralPreset(preset, true);
   }
 
+  private loadBuiltinPrefabIslandPreset(): void {
+    this.presetUi.name = BUILTIN_PREFAB_ISLAND_PRESET_NAME;
+    this.applyProceduralPreset(getBuiltinPrefabIslandPreset() as ProceduralPreset, true);
+  }
+
   private createGui(): GUI {
     const gui = new GUI({ title: 'Island Generator' });
     this.refreshPresetNames();
@@ -4387,6 +4393,9 @@ export class SceneController {
     this.updatePresetSelectionController();
     presetFolder.add({ savePreset: () => this.saveCurrentPreset() }, 'savePreset').name('Save preset');
     presetFolder.add({ loadPreset: () => this.loadPreset() }, 'loadPreset').name('Load preset');
+    presetFolder
+      .add({ loadBuiltinPrefabIsland: () => this.loadBuiltinPrefabIslandPreset() }, 'loadBuiltinPrefabIsland')
+      .name('Load prefab island');
     presetFolder.open();
 
     const prefabFolder = gui.addFolder('Prefab Buildings');
