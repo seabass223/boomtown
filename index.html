@@ -32,12 +32,28 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 9 6-9 6V6Z"/></svg>
           <span>Simulate</span>
         </button>
+        <button
+          class="mode-tool mode-tool--accent test-fireworks-button"
+          type="button"
+          title="Make it night and launch a 30-firework test show"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 3v4M12 17v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M3 12h4M17 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/>
+            <circle cx="12" cy="12" r="2.5"/>
+          </svg>
+          <span>Test Fireworks</span>
+        </button>
       </nav>
       <section class="simulation-hud" aria-live="polite" hidden>
-        <span class="simulation-hud__date">July 1</span>
-        <time class="simulation-hud__clock">8:00 AM</time>
-        <button class="simulation-hud__pause" type="button" aria-label="Pause simulation" aria-pressed="false">Ⅱ</button>
-        <button class="simulation-hud__speed" type="button" aria-label="Simulation speed">1×</button>
+        <div class="simulation-hud__calendar">
+          <span class="simulation-hud__date">July 1</span>
+          <time class="simulation-hud__clock">8:00 AM</time>
+          <span class="simulation-hud__weather" aria-hidden="true">☀</span>
+        </div>
+        <div class="simulation-hud__controls">
+          <button class="simulation-hud__pause" type="button" aria-label="Pause simulation" aria-pressed="false">Ⅱ</button>
+          <button class="simulation-hud__speed" type="button" aria-label="Simulation speed">▶</button>
+        </div>
       </section>
       <section class="simulation-objective-panel" aria-live="polite" hidden>
         <strong>Objective: Build the Launch Field and maximize launchable fireworks by July 4, 8:00 PM</strong>
@@ -51,14 +67,14 @@
         <button class="simulation-worker-panel__idle" type="button">Idle 0</button>
       </section>
       <section class="simulation-resource-hud" aria-label="Town resources" hidden>
-        <span data-resource="wood">🪵 Wood <strong>0</strong></span>
-        <span data-resource="water">💧 Water <strong>0</strong></span>
-        <span data-resource="ore">⛏ Ore <strong>0</strong></span>
-        <span data-resource="stone">◆ Stone <strong>0</strong></span>
-        <span data-resource="fireworks">✦ Made <strong>0</strong></span>
-        <span data-resource="staged">🚀 Staged <strong>0</strong></span>
-        <span data-resource="launchable">★ Ready <strong>0</strong></span>
-        <small class="simulation-resource-hud__cargo">In transit: 0</small>
+        <span data-resource="wood"><i aria-hidden="true">🪵</i><small>Wood</small><strong>0</strong></span>
+        <span data-resource="water"><i aria-hidden="true">💧</i><small>Water</small><strong>0</strong></span>
+        <span data-resource="ore"><i aria-hidden="true">💎</i><small>Ore</small><strong>0</strong></span>
+        <span data-resource="stone"><i aria-hidden="true">🪨</i><small>Stone</small><strong>0</strong></span>
+        <span data-resource="fireworks"><i aria-hidden="true">🎆</i><small>Made</small><strong>0</strong></span>
+        <span data-resource="staged"><i aria-hidden="true">🚀</i><small>Staged</small><strong>0</strong></span>
+        <span data-resource="launchable"><i aria-hidden="true">⭐</i><small>Ready</small><strong>0</strong></span>
+        <small class="simulation-resource-hud__cargo"><i aria-hidden="true">🚚</i><span>In transit</span><strong>0</strong></small>
         <small class="simulation-resource-hud__capacity">Capacity 0 · Minimum 12</small>
       </section>
       <section class="simulation-building-panel" aria-live="polite" hidden>
@@ -106,6 +122,7 @@
         </div>
       </div>
       <canvas id="scene"></canvas>
+      <div class="ocean-edge-fog" aria-hidden="true"></div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

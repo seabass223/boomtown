@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "lan": "vite --host 0.0.0.0",
-    "build": "tsc && vite build",
+    "build": "node scripts/build.mjs",
+    "deploy": "node scripts/deploy-azure.mjs",
+    "deploy:dry-run": "node scripts/deploy-azure.mjs --dry-run",
     "test": "node --experimental-strip-types --test tests/*.test.mjs",
     "preview": "vite preview",
     "preview:lan": "vite preview --host 0.0.0.0"

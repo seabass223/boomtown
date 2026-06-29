@@ -1,9 +1,12 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import fireworksFactoryModelUrl from '../assets/models/fireworks_factory.glb?url';
+import launchFieldModelUrl from '../assets/models/launch_field.glb?url';
+import lumberMillModelUrl from '../assets/models/lumber_mill.glb?url';
 import plazaModelUrl from '../assets/models/plaza.glb?url';
+import quarryModelUrl from '../assets/models/quarry.glb?url';
 import waterTowerModelUrl from '../assets/models/water_tower.glb?url';
-import { box, cylinder, labelSprite } from './helpers';
+import { box, cylinder } from './helpers';
 import { mat, palette } from './materials';
 
 export type PrefabBuildingKey =
@@ -49,7 +52,10 @@ const prefabModelCache = new Map<string, Promise<THREE.Group>>();
 
 const PREFAB_MODEL_URLS: Partial<Record<PrefabBuildingKey, string>> = {
   waterTower: waterTowerModelUrl,
+  lumberMill: lumberMillModelUrl,
+  launchPad: launchFieldModelUrl,
   fireworksFactory: fireworksFactoryModelUrl,
+  quarry: quarryModelUrl,
   plaza: plazaModelUrl,
 };
 const HOUSE_MODEL_URLS = import.meta.glob<string>(
@@ -76,9 +82,9 @@ export const PREFAB_BUILDINGS: readonly PrefabBuildingDefinition[] = [
   },
   {
     key: 'launchPad',
-    label: 'Launch Pad',
+    label: 'Launch Field',
     requiredCount: 1,
-    dimensions: { width: 3, length: 3, height: 1 },
+    dimensions: { width: 4, length: 4, height: 1 },
     color: palette.stoneDark,
     accentColor: palette.yellow,
   },
@@ -258,33 +264,38 @@ export function createPrefabBuilding(
   group.userData.dimensions = { ...definition.dimensions };
 
   group.add(box(dimensions.width, 0.08, dimensions.length, accentMaterial, 0, 0.04, 0));
-  const label = labelSprite(`${definition.label} ${definition.dimensions.width}x${definition.dimensions.length}x${definition.dimensions.height}`);
-  label.name = `${definition.label} label`;
-  label.position.set(0, dimensions.height + 0.45, dimensions.length * 0.38);
-  group.add(label);
-
   switch (definition.key) {
     case 'waterTower': {
       const fallback = new THREE.Group();
       fallback.name = 'Water Tower primitive fallback';
       addWaterTowerPrimitive(fallback, dimensions, material, accentMaterial, darkMaterial);
       group.add(fallback);
-      void replaceFallbackWithModel(group, fallback, definition, label);
+      void replaceFallbackWithModel(group, fallback, definition);
       break;
     }
-    case 'lumberMill':
-      addBlockBuilding(group, dimensions, material, accentMaterial, 0.76);
-      addStackedLogs(group, dimensions, darkMaterial);
+    case 'lumberMill': {
+      const fallback = new THREE.Group();
+      fallback.name = 'Lumber Mill primitive fallback';
+      addBlockBuilding(fallback, dimensions, material, accentMaterial, 0.76);
+      addStackedLogs(fallback, dimensions, darkMaterial);
+      group.add(fallback);
+      void replaceFallbackWithModel(group, fallback, definition);
       break;
-    case 'launchPad':
-      addLaunchPadPrimitive(group, dimensions, material, accentMaterial);
+    }
+    case 'launchPad': {
+      const fallback = new THREE.Group();
+      fallback.name = 'Launch Field primitive fallback';
+      addLaunchPadPrimitive(fallback, dimensions, material, accentMaterial);
+      group.add(fallback);
+      void replaceFallbackWithModel(group, fallback, definition);
       break;
+    }
     case 'house': {
       const fallback = new THREE.Group();
       fallback.name = 'House primitive fallback';
       addHousePrimitive(fallback, dimensions, material, accentMaterial);
       group.add(fallback);
-      void replaceFallbackWithModel(group, fallback, definition, label, houseOrdinal);
+      void replaceFallbackWithModel(group, fallback, definition, houseOrdinal);
       break;
     }
     case 'fireworksFactory': {
@@ -293,18 +304,23 @@ export function createPrefabBuilding(
       addBlockBuilding(fallback, dimensions, material, accentMaterial, 0.72);
       fallback.add(box(dimensions.width * 0.26, dimensions.height * 0.58, dimensions.length * 0.28, accentMaterial, -dimensions.width * 0.28, dimensions.height * 0.56, 0));
       group.add(fallback);
-      void replaceFallbackWithModel(group, fallback, definition, label);
+      void replaceFallbackWithModel(group, fallback, definition);
       break;
     }
-    case 'quarry':
-      addQuarryPrimitive(group, dimensions, material, accentMaterial);
+    case 'quarry': {
+      const fallback = new THREE.Group();
+      fallback.name = 'Quarry primitive fallback';
+      addQuarryPrimitive(fallback, dimensions, material, accentMaterial);
+      group.add(fallback);
+      void replaceFallbackWithModel(group, fallback, definition);
       break;
+    }
     case 'plaza': {
       const fallback = new THREE.Group();
       fallback.name = 'Plaza primitive fallback';
       addPlazaPrimitive(fallback, dimensions, material, accentMaterial);
       group.add(fallback);
-      void replaceFallbackWithModel(group, fallback, definition, label);
+      void replaceFallbackWithModel(group, fallback, definition);
       break;
     }
   }
@@ -321,7 +337,7 @@ function getPrefabModel(url: string): Promise<THREE.Group> {
   return model;
 }
 
-function cloneModelForPrefab(source: THREE.Group): THREE.Group {
+function cloneModelForPrefab(source: THREE.Group, albedoScale = 1): THREE.Group {
   const clone = source.clone(true);
   clone.traverse((object) => {
     const mesh = object as THREE.Mesh;
@@ -332,6 +348,12 @@ function cloneModelForPrefab(source: THREE.Group): THREE.Group {
     mesh.material = Array.isArray(mesh.material)
       ? mesh.material.map((material) => material.clone())
       : mesh.material.clone();
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    materials.forEach((material) => {
+      if (material instanceof THREE.MeshStandardMaterial) {
+        material.color.multiplyScalar(albedoScale);
+      }
+    });
     mesh.castShadow = true;
     mesh.receiveShadow = true;
   });
@@ -354,7 +376,6 @@ async function replaceFallbackWithModel(
   prefab: THREE.Group,
   fallback: THREE.Group,
   definition: PrefabBuildingDefinition,
-  label: THREE.Sprite,
   houseOrdinal?: number,
 ): Promise<void> {
   const url = definition.key === 'house' && houseOrdinal !== undefined
@@ -366,7 +387,7 @@ async function replaceFallbackWithModel(
 
   try {
     const source = await getPrefabModel(url);
-    const model = cloneModelForPrefab(source);
+    const model = cloneModelForPrefab(source, definition.key === 'waterTower' ? 4 : 0.33);
     if (!prefab.parent) {
       disposeDetachedObject(model);
       return;
@@ -377,7 +398,11 @@ async function replaceFallbackWithModel(
     const sourceCenter = sourceBounds.getCenter(new THREE.Vector3());
     const dimensions = getPrefabWorldDimensions(definition);
     const modelScaleMultiplier =
-      definition.key === 'plaza' || definition.key === 'house' ? 3 : 2;
+      definition.key === 'launchPad'
+        ? 3
+        : definition.key === 'plaza' || definition.key === 'house'
+          ? 1.8
+          : 2;
     const scale = Math.min(
       (dimensions.width * 0.94) / Math.max(0.001, sourceSize.x),
       (dimensions.length * 0.94) / Math.max(0.001, sourceSize.z),
@@ -395,7 +420,6 @@ async function replaceFallbackWithModel(
     fallback.removeFromParent();
     disposeDetachedObject(fallback);
     prefab.add(model);
-    label.position.y = sourceSize.y * scale + 0.53;
   } catch (error) {
     console.warn(`Could not load ${definition.label} model; keeping primitive fallback.`, error);
   }

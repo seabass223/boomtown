@@ -15,6 +15,7 @@ const simulationSpeedButton = document.querySelector<HTMLButtonElement>('.simula
 const simulationPauseButton = document.querySelector<HTMLButtonElement>('.simulation-hud__pause');
 const idleWorkerButton = document.querySelector<HTMLButtonElement>('.simulation-worker-panel__idle');
 const onboardingDismiss = document.querySelector<HTMLButtonElement>('.simulation-onboarding__dismiss');
+const testFireworksButton = document.querySelector<HTMLButtonElement>('.test-fireworks-button');
 
 toolbar?.addEventListener('click', (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-mode]');
@@ -64,6 +65,10 @@ idleWorkerButton?.addEventListener('click', () => {
 
 onboardingDismiss?.addEventListener('click', () => {
   scene.dismissOnboarding();
+});
+
+testFireworksButton?.addEventListener('click', () => {
+  scene.testFireworksShow();
 });
 
 scene.start();

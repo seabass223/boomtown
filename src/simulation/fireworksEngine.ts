@@ -49,14 +49,14 @@ export function createFireworksShowPlan(
     return {
       index,
       launchAtSeconds: 0.7 + progress * Math.max(0.5, durationSeconds - 3) + random() * 0.32,
-      x: (random() - 0.5) * 8,
-      y: 3.8 + random() * 4.2,
-      z: (random() - 0.5) * 3,
+      x: (random() - 0.5) * 9.5,
+      y: 4 + random() * 4.8,
+      z: (random() - 0.5) * 3.6,
       color: colors[Math.floor(random() * colors.length)],
-      size: 0.75 + random() * 0.85,
+      size: 0.95 + random() * 1.15,
       pattern: patterns[Math.floor(random() * patterns.length)],
-      particleCount: 24 + Math.floor(random() * 25),
-      lifetimeSeconds: 1.2 + random() * 0.9,
+      particleCount: 34 + Math.floor(random() * 32),
+      lifetimeSeconds: 1.45 + random() * 1.05,
     };
   });
   return { seed, launchedCount, durationSeconds, bursts };

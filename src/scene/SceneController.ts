@@ -1,7 +1,11 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { GUI } from 'three/examples/jsm/libs/lil-gui.module.min.js';
 import type { NumberController } from 'three/examples/jsm/libs/lil-gui.module.min.js';
+import workerModelUrl from '../assets/models/worker.glb?url';
+import grassPainterlyUrl from '../assets/textures/grass-painterly.png?url';
+import { WorkerCharacterDriver } from './WorkerCharacterDriver';
 import {
   PREFAB_BUILDING_LABELS,
   PREFAB_BUILDINGS,
@@ -251,7 +255,12 @@ type WalkwayPathGraph = {
 };
 
 type SimulationWorker = {
-  mesh: THREE.Mesh<THREE.BoxGeometry, THREE.MeshStandardMaterial>;
+  mesh: THREE.Group;
+  materials: THREE.MeshStandardMaterial[];
+  disposableGeometry: THREE.BufferGeometry | null;
+  driver: WorkerCharacterDriver | null;
+  walkPhase: number;
+  isMoving: boolean;
   state: WorkerRunState;
   baseColor: number;
   homeBuildingIndex: number;
@@ -269,10 +278,19 @@ type GrassTexturePathOverlay = {
 };
 
 type ActiveFireworkBurst = {
+  shell: THREE.Mesh<THREE.SphereGeometry, THREE.MeshBasicMaterial>;
+  trail: THREE.Line<THREE.BufferGeometry, THREE.LineBasicMaterial>;
   points: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
+  glow: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
   plan: FireworkBurstPlan;
   directions: Array<[number, number, number]>;
   startedAtSeconds: number;
+  explodedAtSeconds: number | null;
+  fuseSeconds: number;
+  launchStart: THREE.Vector3;
+  launchControl: THREE.Vector3;
+  launchTarget: THREE.Vector3;
+  trailHistory: THREE.Vector3[];
 };
 
 type FireworksFinaleState = {
@@ -293,6 +311,7 @@ const PRESET_STORAGE_KEY = 'boomtown-island-procedural-presets';
 const EMPTY_PRESET_OPTION = 'No saved presets';
 const PREFAB_NATURAL_OBJECT_CLEARANCE = 0.06;
 const OCEAN_PLANE_SIZE = 160;
+const OCEAN_EDGE_FOG_WIDTH = 64;
 const SIMULATION_START_HOUR = 8;
 const SIMULATION_DAY_MINUTES = GAME_RULES.schedule.workdayMinutes;
 const SIMULATION_RETURN_MINUTE = GAME_RULES.schedule.returnMinute;
@@ -300,6 +319,9 @@ const SIMULATION_MINUTES_PER_REAL_SECOND = GAME_RULES.schedule.simulationMinutes
 const SIMULATION_BASE_REALTIME_MULTIPLIER = GAME_RULES.schedule.baselineRealtimeMultiplier;
 const SIMULATION_CLOCK_STEP_MINUTES = GAME_RULES.schedule.clockStepMinutes;
 const SIMULATION_WORKER_SPEED = 2.46;
+const SIMULATION_WORKER_MODEL_SCALE = 0.84;
+const SIMULATION_WORKER_FALLBACK_SCALE = 2;
+const SIMULATION_WORKER_STRIDE_LENGTH = 0.72;
 const SIMULATION_WORKER_LANE_OFFSET = 0.16;
 const SIMULATION_WORKER_MIN_SEPARATION = 0.28;
 const SIMULATION_GATHER_SECONDS = GAME_RULES.workers.gatherSeconds;
@@ -314,6 +336,8 @@ const WORKER_STATE_COLORS: Record<WorkerTaskState, number> = {
   'producing-building': 0xba78d1,
   'returning-home': 0x9099a2,
 };
+const workerModelLoader = new GLTFLoader();
+const workerModelPromise = workerModelLoader.loadAsync(workerModelUrl);
 const ROCK_GEOMETRIES = new Map<string, THREE.BufferGeometry>();
 const TREE_GEOMETRIES = new Map<string, THREE.BufferGeometry>();
 const VIBE_PRESET_NAMES: VibePresetName[] = [
@@ -752,8 +776,12 @@ function createGrassTexture(settings: GrassTextureSettings, pathOverlay?: GrassT
   const canvas = document.createElement('canvas');
   canvas.width = GRASS_TEXTURE_SIZE;
   canvas.height = GRASS_TEXTURE_SIZE;
-  paintGrassTexture(canvas, settings);
-  paintWalkwayPathsIntoGrassTexture(canvas, pathOverlay, settings.seed);
+  const repaint = (sourceImage?: HTMLImageElement): void => {
+    paintGrassTexture(canvas, settings, sourceImage);
+    paintWalkwayPathsIntoGrassTexture(canvas, pathOverlay, settings.seed);
+  };
+
+  repaint(getLoadedPainterlyGrassImage());
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
@@ -763,10 +791,48 @@ function createGrassTexture(settings: GrassTextureSettings, pathOverlay?: GrassT
   texture.magFilter = THREE.NearestFilter;
   texture.minFilter = THREE.LinearMipmapLinearFilter;
   texture.generateMipmaps = true;
+
+  if (!getLoadedPainterlyGrassImage()) {
+    void loadPainterlyGrassImage()
+      .then((sourceImage) => {
+        repaint(sourceImage);
+        texture.needsUpdate = true;
+      })
+      .catch(() => {
+        painterlyGrassImagePromise = undefined;
+      });
+  }
+
   return texture;
 }
 
-function paintGrassTexture(canvas: HTMLCanvasElement, settings: GrassTextureSettings): void {
+let painterlyGrassImage: HTMLImageElement | undefined;
+let painterlyGrassImagePromise: Promise<HTMLImageElement> | undefined;
+
+function getLoadedPainterlyGrassImage(): HTMLImageElement | undefined {
+  return painterlyGrassImage?.complete && painterlyGrassImage.naturalWidth > 0 ? painterlyGrassImage : undefined;
+}
+
+function loadPainterlyGrassImage(): Promise<HTMLImageElement> {
+  painterlyGrassImagePromise ??= new Promise((resolve, reject) => {
+    const image = new Image();
+    image.decoding = 'async';
+    image.onload = () => {
+      painterlyGrassImage = image;
+      resolve(image);
+    };
+    image.onerror = () => reject(new Error('Could not load the painterly grass texture.'));
+    image.src = grassPainterlyUrl;
+  });
+
+  return painterlyGrassImagePromise;
+}
+
+function paintGrassTexture(
+  canvas: HTMLCanvasElement,
+  settings: GrassTextureSettings,
+  sourceImage?: HTMLImageElement,
+): void {
   const context = canvas.getContext('2d');
   if (!context) {
     return;
@@ -775,72 +841,103 @@ function paintGrassTexture(canvas: HTMLCanvasElement, settings: GrassTextureSett
   const random = createSeededRandom(settings.seed);
   const width = canvas.width;
   const height = canvas.height;
-  const base = new THREE.Color(0x7da538);
-  const image = context.createImageData(width, height);
+  context.clearRect(0, 0, width, height);
 
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const index = (y * width + x) * 4;
-      const largeNoise =
-        Math.sin((x + settings.seed * 13) * 0.028) * 0.5 +
-        Math.cos((y - settings.seed * 7) * 0.023) * 0.5 +
-        Math.sin((x + y) * 0.014) * 0.35;
-      const smallNoise = random() - 0.5;
-      const shade = 1 + (largeNoise * 0.08 + smallNoise * 0.08) * settings.colorVariation;
-
-      image.data[index] = Math.round(base.r * 255 * shade);
-      image.data[index + 1] = Math.round(base.g * 255 * shade);
-      image.data[index + 2] = Math.round(base.b * 255 * shade);
-      image.data[index + 3] = 255;
-    }
+  if (sourceImage) {
+    context.save();
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = 'high';
+    context.filter = `saturate(${0.94 + settings.colorVariation * 0.12}) contrast(${
+      0.97 + settings.colorVariation * 0.06
+    })`;
+    context.drawImage(sourceImage, 0, 0, width, height);
+    context.restore();
+  } else {
+    context.fillStyle = '#88a83f';
+    context.fillRect(0, 0, width, height);
   }
 
-  context.putImageData(image, 0, 0);
   context.globalCompositeOperation = 'source-over';
 
-  const patchCount = Math.round(30 + settings.patchScale * 72);
+  const patchPalette = ['#c0c956', '#a6bc45', '#708b31', '#5f792c', '#a99b45'];
+  const patchCount = Math.round(6 + settings.colorVariation * 18);
   for (let i = 0; i < patchCount; i += 1) {
-    const radiusX = THREE.MathUtils.lerp(18, 72, random()) * settings.patchScale;
-    const radiusY = radiusX * THREE.MathUtils.lerp(0.28, 0.72, random());
+    const radiusX = THREE.MathUtils.lerp(36, 108, random()) * (0.72 + settings.patchScale * 0.42);
+    const radiusY = radiusX * THREE.MathUtils.lerp(0.42, 0.78, random());
     const x = random() * width;
     const y = random() * height;
-    const rotation = random() * Math.PI;
-    const hue = THREE.MathUtils.lerp(72, 103, random());
-    const lightness = THREE.MathUtils.lerp(25, 47, random());
-    const alpha = THREE.MathUtils.lerp(0.08, 0.24, random()) * settings.colorVariation;
-    drawSoftOval(context, x, y, radiusX, radiusY, rotation, `hsla(${hue}, 48%, ${lightness}%, ${alpha})`);
+    context.fillStyle = withCanvasAlpha(
+      patchPalette[Math.floor(random() * patchPalette.length)],
+      THREE.MathUtils.lerp(0.018, 0.065, random()) * settings.colorVariation,
+    );
+    drawPainterlyPatch(context, random, x, y, radiusX, radiusY, random() * Math.PI);
+    context.fill();
   }
 
-  const dryPatchCount = Math.round(settings.dryFlecks * 58);
+  const dryPatchCount = Math.round(settings.dryFlecks * 18);
   for (let i = 0; i < dryPatchCount; i += 1) {
-    const radiusX = THREE.MathUtils.lerp(8, 34, random());
-    const radiusY = radiusX * THREE.MathUtils.lerp(0.2, 0.5, random());
-    drawSoftOval(
-      context,
-      random() * width,
-      random() * height,
-      radiusX,
-      radiusY,
-      random() * Math.PI,
-      `hsla(${THREE.MathUtils.lerp(38, 52, random())}, 48%, 38%, ${THREE.MathUtils.lerp(0.1, 0.28, random())})`,
+    const radiusX = THREE.MathUtils.lerp(7, 22, random());
+    const radiusY = radiusX * THREE.MathUtils.lerp(0.35, 0.7, random());
+    context.fillStyle = withCanvasAlpha(
+      random() > 0.48 ? '#b19a4d' : '#947c3d',
+      THREE.MathUtils.lerp(0.06, 0.14, random()),
     );
+    drawPainterlyPatch(context, random, random() * width, random() * height, radiusX, radiusY, random() * Math.PI);
+    context.fill();
   }
 
   context.lineCap = 'round';
-  const bladeCount = Math.round(settings.bladeDensity * 720);
-  for (let i = 0; i < bladeCount; i += 1) {
-    const x = random() * width;
-    const y = random() * height;
-    const length = THREE.MathUtils.lerp(5, 20, random());
-    const angle = -0.75 + (random() - 0.5) * 0.95;
-    const brightness = THREE.MathUtils.lerp(30, 58, random());
-    context.strokeStyle = `hsla(${THREE.MathUtils.lerp(75, 112, random())}, 42%, ${brightness}%, ${THREE.MathUtils.lerp(0.12, 0.32, random())})`;
-    context.lineWidth = THREE.MathUtils.lerp(1, 2.6, random());
-    context.beginPath();
-    context.moveTo(x, y);
-    context.lineTo(x + Math.cos(angle) * length, y + Math.sin(angle) * length);
-    context.stroke();
+  context.lineJoin = 'round';
+  const tuftClusterCount = Math.round(settings.bladeDensity * 22);
+  for (let cluster = 0; cluster < tuftClusterCount; cluster += 1) {
+    const centerX = random() * width;
+    const centerY = random() * height;
+    const tuftCount = 2 + Math.floor(random() * 4);
+    for (let tuft = 0; tuft < tuftCount; tuft += 1) {
+      const x = centerX + THREE.MathUtils.lerp(-16, 16, random());
+      const y = centerY + THREE.MathUtils.lerp(-12, 12, random());
+      const length = THREE.MathUtils.lerp(4, 9, random());
+      context.strokeStyle = withCanvasAlpha(random() > 0.42 ? '#4f7229' : '#c1ca59', 0.22);
+      context.lineWidth = THREE.MathUtils.lerp(1.2, 2.2, random());
+      context.beginPath();
+      context.moveTo(x - length * 0.46, y - length * 0.55);
+      context.lineTo(x, y);
+      context.lineTo(x + length * 0.34, y - length * 0.72);
+      context.stroke();
+    }
   }
+}
+
+function drawPainterlyPatch(
+  context: CanvasRenderingContext2D,
+  random: () => number,
+  centerX: number,
+  centerY: number,
+  radiusX: number,
+  radiusY: number,
+  rotation: number,
+): void {
+  const pointCount = 14;
+  context.beginPath();
+  for (let index = 0; index < pointCount; index += 1) {
+    const angle = (index / pointCount) * Math.PI * 2;
+    const scallop = THREE.MathUtils.lerp(0.78, 1.12, random());
+    const localX = Math.cos(angle) * radiusX * scallop;
+    const localY = Math.sin(angle) * radiusY * scallop;
+    const x = centerX + localX * Math.cos(rotation) - localY * Math.sin(rotation);
+    const y = centerY + localX * Math.sin(rotation) + localY * Math.cos(rotation);
+    if (index === 0) {
+      context.moveTo(x, y);
+    } else {
+      context.lineTo(x, y);
+    }
+  }
+  context.closePath();
+}
+
+function withCanvasAlpha(hex: string, alpha: number): string {
+  const color = new THREE.Color(hex);
+  return `rgba(${Math.round(color.r * 255)}, ${Math.round(color.g * 255)}, ${Math.round(color.b * 255)}, ${alpha})`;
 }
 
 function paintWalkwayPathsIntoGrassTexture(
@@ -1091,6 +1188,10 @@ function createLowPolyOceanMaterial(settings: WaterSettings): THREE.ShaderMateri
       uDeepColor: { value: new THREE.Color(0x0d2c48) },
       uClearColor: { value: new THREE.Color(0x4fa7a1) },
       uLightColor: { value: new THREE.Color(0xd6eee8) },
+      uEdgeFogColor: { value: new THREE.Color(0x9bc7dd) },
+      uEdgeFogStrength: { value: settings.edgeFog ? 1 : 0 },
+      uEdgeFogStart: { value: OCEAN_PLANE_SIZE * 0.5 - OCEAN_EDGE_FOG_WIDTH },
+      uEdgeFogEnd: { value: OCEAN_PLANE_SIZE * 0.5 },
     },
   ]);
 
@@ -1130,6 +1231,10 @@ function createLowPolyOceanMaterial(settings: WaterSettings): THREE.ShaderMateri
       uniform vec3 uDeepColor;
       uniform vec3 uClearColor;
       uniform vec3 uLightColor;
+      uniform vec3 uEdgeFogColor;
+      uniform float uEdgeFogStrength;
+      uniform float uEdgeFogStart;
+      uniform float uEdgeFogEnd;
       varying float vWave;
       varying vec2 vGrid;
 
@@ -1143,6 +1248,12 @@ function createLowPolyOceanMaterial(settings: WaterSettings): THREE.ShaderMateri
         color = mix(color, uLightColor, ridge);
         gl_FragColor = vec4(color, 1.0);
         #include <fog_fragment>
+
+        // Feather the finite ocean mesh into the sky color so low camera
+        // angles reveal a bank of haze instead of a hard geometric edge.
+        float edgeDistance = max(abs(vGrid.x), abs(vGrid.y));
+        float edgeFog = smoothstep(uEdgeFogStart, uEdgeFogEnd, edgeDistance) * uEdgeFogStrength;
+        gl_FragColor.rgb = mix(gl_FragColor.rgb, uEdgeFogColor, edgeFog);
       }
     `,
   });
@@ -1435,8 +1546,16 @@ function createTreeGenerator(outlinePoints: THREE.Vector2[], topY: number, setti
   const bounds = new THREE.Box2().setFromPoints(outlinePoints);
   const area = Math.abs(polygonArea(outlinePoints));
   const random = createSeededRandom(seed + 4819);
-  const count = Math.round(THREE.MathUtils.clamp(area * THREE.MathUtils.lerp(0.12, 0.72, settings.densityJitter), 3, 64));
-  const minSpacing = THREE.MathUtils.lerp(1.35, 0.68, settings.densityJitter);
+  const fullCoverage = settings.distribution * settings.distribution;
+  const boundsSize = bounds.getSize(new THREE.Vector2());
+  const maxInteriorDepth = Math.min(boundsSize.x, boundsSize.y) * 0.5 + 0.25;
+  const density =
+    THREE.MathUtils.lerp(0.12, 0.72, settings.densityJitter) +
+    THREE.MathUtils.lerp(0, 1.15, fullCoverage);
+  const count = Math.round(THREE.MathUtils.clamp(area * density, 3, 140));
+  const minSpacing =
+    THREE.MathUtils.lerp(1.35, 0.68, settings.densityJitter) *
+    THREE.MathUtils.lerp(1, 0.68, fullCoverage);
   const placed: THREE.Vector2[] = [];
   let attempts = 0;
 
@@ -1452,13 +1571,14 @@ function createTreeGenerator(outlinePoints: THREE.Vector2[], topY: number, setti
     }
 
     const edgeDistance = distanceToOutline(candidate, outlinePoints);
-    const borderBandWidth = THREE.MathUtils.lerp(0.72, 4.6, settings.distribution);
+    const borderBandWidth = THREE.MathUtils.lerp(0.72, maxInteriorDepth, settings.distribution);
     if (edgeDistance > borderBandWidth) {
       continue;
     }
 
     const coastlineWeight = 1 - THREE.MathUtils.smoothstep(edgeDistance, borderBandWidth * 0.35, borderBandWidth);
-    const desiredWeight = THREE.MathUtils.lerp(coastlineWeight, 1, settings.distribution);
+    const uniformity = settings.distribution * settings.distribution * settings.distribution;
+    const desiredWeight = THREE.MathUtils.lerp(coastlineWeight, 1, uniformity);
     if (random() > THREE.MathUtils.clamp(desiredWeight, 0, 1)) {
       continue;
     }
@@ -1733,12 +1853,12 @@ function createRockGeometryVariant(type: RockVariantType, detail: number): THREE
 }
 
 function createRockMaterialPalette(settings: IslandSettings): THREE.MeshStandardMaterial[] {
-  const base = new THREE.Color(0xd4a672);
+  const base = new THREE.Color(0xd5a773);
   const accents = [
-    new THREE.Color(0x9a7e68),
-    new THREE.Color(0x8a7d78),
-    new THREE.Color(0xae8969),
-    new THREE.Color(0xe9b97d),
+    new THREE.Color(0xe8bf87),
+    new THREE.Color(0xc8945f),
+    new THREE.Color(0xb77f4e),
+    new THREE.Color(0xdfb27d),
   ];
 
   return accents.map((accent, index) => {
@@ -1824,7 +1944,7 @@ function placeRockRingAroundIsland(outlinePoints: THREE.Vector2[], settings: Isl
         1 + settings.rockColorJitter * 0.16,
         random(),
       );
-      color.set(materials[variantIndex].color).multiplyScalar(brightness);
+      color.setRGB(brightness, brightness, brightness);
       mesh.setColorAt(instanceIndex, color);
     });
 
@@ -1879,6 +1999,8 @@ export class SceneController {
   private readonly rimLight = new THREE.DirectionalLight(0xa6d9ff, 1.2);
   private readonly fillLight = new THREE.AmbientLight(0xffd5ad, 0.45);
   private readonly waterMaterial: THREE.ShaderMaterial;
+  private readonly oceanEdgeFogOverlay: HTMLElement | null;
+  private readonly oceanCutoffProbe = new THREE.Vector3();
   private readonly baseMaterialColors = new WeakMap<THREE.Material, THREE.Color>();
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointer = new THREE.Vector2();
@@ -1927,11 +2049,11 @@ export class SceneController {
     seed: 42,
   };
   private readonly grassSettings: GrassTextureSettings = {
-    patchScale: 0.78,
-    colorVariation: 0.82,
-    bladeDensity: 0.62,
-    dryFlecks: 0.34,
-    textureScale: 0.36,
+    patchScale: 0.92,
+    colorVariation: 0.48,
+    bladeDensity: 0.12,
+    dryFlecks: 0.12,
+    textureScale: 0.72,
     seed: 217,
   };
   private readonly treeSettings: TreeSettings = {
@@ -2008,6 +2130,7 @@ export class SceneController {
   private readonly resizeObserver: ResizeObserver;
 
   public constructor(private readonly canvas: HTMLCanvasElement) {
+    this.oceanEdgeFogOverlay = document.querySelector<HTMLElement>('.ocean-edge-fog');
     this.renderer = new THREE.WebGLRenderer({
       canvas,
       antialias: true,
@@ -2163,6 +2286,290 @@ export class SceneController {
     this.showSimulationNotice(playerPaused ? 'Simulation resumed.' : 'Paused. Inspect and queue assignments.');
   }
 
+  public testFireworksShow(): void {
+    this.setVibePreset('Warm Lantern Night', 0);
+    this.startFireworksShow(30, 30704);
+    this.showSimulationNotice('Testing 30 fireworks.');
+  }
+
+  private setVibePreset(preset: VibePresetName, blend = this.vibeSettings.blend): void {
+    this.vibeSettings.preset = preset;
+    this.vibeSettings.blend = blend;
+    this.syncVibePresetToCurrentSelection();
+  }
+
+  private syncVibePresetToCurrentSelection(updateDisplays = true): void {
+    const preset = resolveVibe(this.vibeSettings);
+    this.vibeSettings.sunHeight = preset.sunHeight;
+    this.vibeSettings.sunWarmth = preset.sunWarmth;
+    this.vibeSettings.sunBrightness = preset.sunBrightness;
+    this.vibeSettings.ambientWarmth = preset.ambientWarmth;
+    this.vibeSettings.shadowLift = preset.shadowLift;
+    this.vibeSettings.contrastSoftness = preset.contrastSoftness;
+    this.vibeSettings.saturation = preset.saturation;
+    this.vibeSettings.warmMidtones = preset.warmMidtones;
+    this.vibeSettings.blueShadowTint = preset.blueShadowTint;
+    this.vibeSettings.waterMood = preset.waterMood;
+    this.vibeSettings.grassWarmth = preset.grassWarmth;
+    this.vibeSettings.rockWarmth = preset.rockWarmth;
+    if (updateDisplays) {
+      this.updateGuiDisplays();
+    }
+    this.applyVibe();
+  }
+
+  private startFireworksShow(launchCount: number, seed: number): void {
+    this.clearFireworksShow();
+    const plan = createFireworksShowPlan(launchCount, seed);
+    this.fireworksFinale = {
+      plan,
+      startedAtSeconds: performance.now() * 0.001,
+      nextBurstIndex: 0,
+      origin: this.getFireworksLaunchOrigin(),
+      bursts: [],
+      cameraPosition: this.camera.position.clone(),
+      cameraTarget: this.controls.target.clone(),
+    };
+  }
+
+  private getFireworksLaunchOrigin(): THREE.Vector3 {
+    const launchPadIndex = this.placedPrefabs.findIndex((prefab) => prefab.key === 'launchPad');
+    if (launchPadIndex >= 0) {
+      const launchPad = this.placedPrefabs[launchPadIndex];
+      const center = getPrefabWorldCenter(getPrefabDefinition(launchPad.key), launchPad.placement);
+      return new THREE.Vector3(center.x, this.settings.rockHeight + 0.18, center.y);
+    }
+    return new THREE.Vector3(0, this.settings.rockHeight + 0.18, 0);
+  }
+
+  private updateFireworksShow(nowSeconds: number): void {
+    const finale = this.fireworksFinale;
+    if (!finale) {
+      return;
+    }
+
+    const elapsed = nowSeconds - finale.startedAtSeconds;
+    while (
+      finale.nextBurstIndex < finale.plan.bursts.length &&
+      elapsed >= finale.plan.bursts[finale.nextBurstIndex].launchAtSeconds
+    ) {
+      const plan = finale.plan.bursts[finale.nextBurstIndex];
+      const launchColor = new THREE.Color(0xffefbd);
+      const glowColor = new THREE.Color(0xfff6de);
+      const shell = new THREE.Mesh(
+        new THREE.SphereGeometry(0.065 + plan.size * 0.016, 12, 12),
+        new THREE.MeshBasicMaterial({
+          color: launchColor,
+          transparent: true,
+          opacity: 0.98,
+        }),
+      );
+      const launchStart = finale.origin.clone();
+      const launchTarget = new THREE.Vector3(
+        finale.origin.x + plan.x,
+        finale.origin.y + plan.y,
+        finale.origin.z + plan.z,
+      );
+      const horizontalDirection = new THREE.Vector3(plan.x, 0, plan.z);
+      const sideDirection = horizontalDirection.lengthSq() > 0.001
+        ? new THREE.Vector3(-horizontalDirection.z, 0, horizontalDirection.x).normalize()
+        : new THREE.Vector3(plan.index % 2 === 0 ? 1 : -1, 0, 0);
+      const sideDriftDistance = 0.18 + plan.size * 0.16 + Math.abs(plan.z) * 0.08;
+      const launchControl = launchStart.clone()
+        .lerp(launchTarget, 0.48)
+        .add(sideDirection.multiplyScalar(sideDriftDistance));
+      launchControl.y += 0.45 + plan.size * 0.2;
+      const trailHistory = Array.from({ length: 8 }, () => launchStart.clone());
+      const trailGeometry = new THREE.BufferGeometry().setFromPoints(trailHistory);
+      const trail = new THREE.Line(
+        trailGeometry,
+        new THREE.LineBasicMaterial({
+          color: launchColor,
+          transparent: true,
+          opacity: 0.55,
+        }),
+      );
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(plan.particleCount * 3), 3));
+      geometry.setAttribute('color', this.createBurstColorAttribute(plan));
+      const material = new THREE.PointsMaterial({
+        size: THREE.MathUtils.lerp(0.24, 0.46, Math.min(1, plan.size / 1.9)),
+        transparent: true,
+        opacity: 1,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexColors: true,
+      });
+      const glow = new THREE.Points(
+        geometry,
+        new THREE.PointsMaterial({
+          color: glowColor,
+          size: THREE.MathUtils.lerp(0.5, 0.86, Math.min(1, plan.size / 1.9)),
+          transparent: true,
+          opacity: 0.42,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        }),
+      );
+      const points = new THREE.Points(geometry, material);
+      points.position.copy(launchTarget);
+      points.frustumCulled = false;
+      points.visible = false;
+      glow.position.copy(launchTarget);
+      glow.frustumCulled = false;
+      glow.visible = false;
+      shell.position.copy(launchStart);
+      shell.renderOrder = 2;
+      trail.frustumCulled = false;
+      this.fireworksLayer.add(trail);
+      this.fireworksLayer.add(shell);
+      this.fireworksLayer.add(points);
+      this.fireworksLayer.add(glow);
+      finale.bursts.push({
+        shell,
+        trail,
+        points,
+        glow,
+        plan,
+        directions: createBurstDirections(plan),
+        startedAtSeconds: nowSeconds,
+        explodedAtSeconds: null,
+        fuseSeconds: 0.52 + plan.size * 0.12,
+        launchStart,
+        launchControl,
+        launchTarget,
+        trailHistory,
+      });
+      finale.nextBurstIndex += 1;
+    }
+
+    finale.bursts = finale.bursts.filter((burst) => {
+      const shellAge = nowSeconds - burst.startedAtSeconds;
+      const particleAge = burst.explodedAtSeconds === null ? 0 : nowSeconds - burst.explodedAtSeconds;
+      if (burst.explodedAtSeconds !== null && particleAge >= burst.plan.lifetimeSeconds) {
+        this.disposeFireworkBurst(burst);
+        return false;
+      }
+      this.updateFireworkBurst(burst, shellAge, particleAge);
+      return true;
+    });
+
+    if (
+      finale.nextBurstIndex >= finale.plan.bursts.length &&
+      finale.bursts.length === 0 &&
+      elapsed >= finale.plan.durationSeconds
+    ) {
+      this.clearFireworksShow();
+    }
+  }
+
+  private createBurstColorAttribute(plan: FireworkBurstPlan): THREE.Float32BufferAttribute {
+    const random = createSeededRandom(plan.index * 6151 + plan.particleCount * 97 + plan.color);
+    const palette = [
+      new THREE.Color(plan.color),
+      new THREE.Color(0xffd166),
+      new THREE.Color(0xef476f),
+      new THREE.Color(0x67d8ff),
+      new THREE.Color(0x71e39a),
+      new THREE.Color(0xffffff),
+    ];
+    const values = new Float32Array(plan.particleCount * 3);
+    for (let index = 0; index < plan.particleCount; index += 1) {
+      const color = palette[Math.floor(random() * palette.length)].clone();
+      color.lerp(new THREE.Color(0xffffff), random() * 0.18);
+      values[index * 3] = color.r;
+      values[index * 3 + 1] = color.g;
+      values[index * 3 + 2] = color.b;
+    }
+    return new THREE.Float32BufferAttribute(values, 3);
+  }
+
+  private updateFireworkBurst(
+    burst: ActiveFireworkBurst,
+    shellAge: number,
+    particleAge: number,
+  ): void {
+    if (burst.explodedAtSeconds === null) {
+      const launchProgress = Math.min(1, shellAge / Math.max(0.01, burst.fuseSeconds));
+      const inverse = 1 - launchProgress;
+      const shellPosition = new THREE.Vector3(
+        inverse * inverse * burst.launchStart.x +
+          2 * inverse * launchProgress * burst.launchControl.x +
+          launchProgress * launchProgress * burst.launchTarget.x,
+        inverse * inverse * burst.launchStart.y +
+          2 * inverse * launchProgress * burst.launchControl.y +
+          launchProgress * launchProgress * burst.launchTarget.y,
+        inverse * inverse * burst.launchStart.z +
+          2 * inverse * launchProgress * burst.launchControl.z +
+          launchProgress * launchProgress * burst.launchTarget.z,
+      );
+      burst.shell.position.copy(shellPosition);
+      burst.trailHistory.shift();
+      burst.trailHistory.push(shellPosition.clone());
+      burst.trail.geometry.setFromPoints(burst.trailHistory);
+      burst.shell.material.opacity = 0.85 + (1 - launchProgress) * 0.1;
+      burst.trail.material.opacity = 0.18 + (1 - launchProgress) * 0.55;
+      burst.shell.scale.setScalar(1 + launchProgress * 0.3);
+      if (launchProgress < 1) {
+        return;
+      }
+      burst.explodedAtSeconds = burst.startedAtSeconds + burst.fuseSeconds;
+      burst.points.visible = true;
+      burst.glow.visible = true;
+      burst.shell.removeFromParent();
+      burst.trail.removeFromParent();
+    }
+
+    const positions = burst.points.geometry.getAttribute('position');
+    const lifetime = Math.max(0.01, burst.plan.lifetimeSeconds);
+    const normalizedAge = particleAge / lifetime;
+    const drag = burst.plan.pattern === 'willow' ? 0.45 : 0.22;
+    const speed = 1.9 + burst.plan.size * 1.95;
+    const gravity = burst.plan.pattern === 'willow' ? 1.6 : 2.3;
+    const distance = Math.max(0, particleAge * speed * (1 - normalizedAge * drag));
+
+    for (let index = 0; index < burst.directions.length; index += 1) {
+      const [x, y, z] = burst.directions[index];
+      const twinkle = burst.plan.pattern === 'star' ? 1 + Math.sin(particleAge * 16 + index) * 0.05 : 1;
+      positions.setXYZ(
+        index,
+        x * distance * twinkle,
+        y * distance - gravity * particleAge * particleAge * 0.5,
+        z * distance * twinkle,
+      );
+    }
+
+    positions.needsUpdate = true;
+    burst.points.material.opacity = Math.max(0, 1 - normalizedAge * 0.92);
+    burst.glow.material.opacity = Math.max(0, 0.45 - normalizedAge * 0.35);
+    burst.points.material.size =
+      THREE.MathUtils.lerp(0.22, 0.38, Math.min(1, burst.plan.size / 1.9)) * (1.2 + normalizedAge * 0.46);
+    burst.glow.material.size =
+      THREE.MathUtils.lerp(0.54, 0.92, Math.min(1, burst.plan.size / 1.9)) * (1.14 + normalizedAge * 0.58);
+  }
+
+  private disposeFireworkBurst(burst: ActiveFireworkBurst): void {
+    burst.shell.removeFromParent();
+    burst.shell.geometry.dispose();
+    burst.shell.material.dispose();
+    burst.trail.removeFromParent();
+    burst.trail.geometry.dispose();
+    burst.trail.material.dispose();
+    burst.points.removeFromParent();
+    burst.points.material.dispose();
+    burst.glow.removeFromParent();
+    burst.glow.material.dispose();
+    burst.points.geometry.dispose();
+  }
+
+  private clearFireworksShow(): void {
+    if (this.fireworksFinale) {
+      this.fireworksFinale.bursts.forEach((burst) => this.disposeFireworkBurst(burst));
+    }
+    this.fireworksLayer.clear();
+    this.fireworksFinale = null;
+  }
+
   private startSimulation(): void {
     this.stopSimulation();
 
@@ -2223,7 +2630,6 @@ export class SceneController {
   }
 
   private stopSimulation(): void {
-    this.stopFireworksFinale();
     this.runState.clock.running = false;
     this.runState.clock.paused = false;
     this.runState.clock.pauseReason = null;
@@ -2285,28 +2691,14 @@ export class SceneController {
   private createSimulationBuildingVisuals(): void {
     this.clearSimulationBuildingVisuals();
     this.placedPrefabs.forEach((prefab, buildingIndex) => {
-      if (prefab.key !== 'launchPad' && prefab.key !== 'fireworksFactory') {
+      if (prefab.key !== 'launchPad') {
         return;
       }
       const definition = getPrefabDefinition(prefab.key);
       const center = getPrefabWorldCenter(definition, prefab.placement);
       const visual = new THREE.Group();
-      visual.name = `${definition.label} simulation progress`;
-      visual.position.set(center.x, this.settings.rockHeight + definition.dimensions.height + 0.65, center.y);
-
-      const background = new THREE.Mesh(
-        new THREE.BoxGeometry(1.25, 0.12, 0.08),
-        new THREE.MeshBasicMaterial({ color: 0x26363c }),
-      );
-      const fill = new THREE.Mesh(
-        new THREE.BoxGeometry(1.18, 0.075, 0.09),
-        new THREE.MeshBasicMaterial({ color: prefab.key === 'launchPad' ? 0xf4d17a : 0x68bb73 }),
-      );
-      fill.name = 'Progress fill';
-      fill.position.z = 0.01;
-      fill.scale.x = 0.001;
-      fill.position.x = -0.59;
-      visual.add(background, fill);
+      visual.name = 'Completed launch racks';
+      visual.position.set(center.x, this.settings.rockHeight + 0.12, center.y);
       this.simulationLayer.add(visual);
       this.simulationBuildingVisuals.set(buildingIndex, visual);
     });
@@ -2332,50 +2724,28 @@ export class SceneController {
   private updateSimulationBuildingVisuals(): void {
     this.simulationBuildingVisuals.forEach((visual, buildingIndex) => {
       const prefab = this.placedPrefabs[buildingIndex];
-      const fill = visual.getObjectByName('Progress fill') as THREE.Mesh | undefined;
-      if (!prefab || !fill) {
+      if (!prefab || prefab.key !== 'launchPad') {
         return;
       }
-      const building = this.runState.buildings.get(buildingIndex);
-      const progress = prefab.key === 'launchPad'
-        ? this.runState.construction.launchFieldComplete
-          ? getConstructionFraction(
-            this.runState.construction.launchRackProgress,
-            ECONOMY_RECIPES['launch-rack'].inputs,
-          )
-          : getConstructionFraction(
-            this.runState.construction.launchFieldProgress,
-            ECONOMY_RECIPES['launch-field'].inputs,
-          )
-        : Math.min(
-          1,
-          (building?.productionProgressSeconds ?? 0) /
-          ECONOMY_RECIPES.fireworks.durationSeconds,
+      const rackCount = visual.children.filter((child) => child.name === 'Completed launch rack').length;
+      for (let index = rackCount; index < this.runState.construction.launchRacks; index += 1) {
+        const rack = new THREE.Group();
+        rack.name = 'Completed launch rack';
+        const base = new THREE.Mesh(
+          new THREE.BoxGeometry(0.42, 0.09, 0.32),
+          new THREE.MeshStandardMaterial({ color: 0x6f5741, roughness: 0.8 }),
         );
-      fill.scale.x = Math.max(0.001, progress);
-      fill.position.x = -0.59 + (1.18 * progress) / 2;
-
-      if (prefab.key === 'launchPad') {
-        const rackCount = visual.children.filter((child) => child.name === 'Completed launch rack').length;
-        for (let index = rackCount; index < this.runState.construction.launchRacks; index += 1) {
-          const rack = new THREE.Group();
-          rack.name = 'Completed launch rack';
-          const base = new THREE.Mesh(
-            new THREE.BoxGeometry(0.42, 0.09, 0.32),
-            new THREE.MeshStandardMaterial({ color: 0x6f5741, roughness: 0.8 }),
+        rack.add(base);
+        for (const offset of [-0.12, 0, 0.12]) {
+          const rocket = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.025, 0.025, 0.36, 8),
+            new THREE.MeshStandardMaterial({ color: offset === 0 ? 0xf4f0df : 0xb9584d }),
           );
-          rack.add(base);
-          for (const offset of [-0.12, 0, 0.12]) {
-            const rocket = new THREE.Mesh(
-              new THREE.CylinderGeometry(0.025, 0.025, 0.36, 8),
-              new THREE.MeshStandardMaterial({ color: offset === 0 ? 0xf4f0df : 0xb9584d }),
-            );
-            rocket.position.set(offset, 0.2, 0);
-            rack.add(rocket);
-          }
-          rack.position.set((index % 3) * 0.52 - 0.52, -0.5, Math.floor(index / 3) * 0.42);
-          visual.add(rack);
+          rocket.position.set(offset, 0.2, 0);
+          rack.add(rocket);
         }
+        rack.position.set((index % 3) * 0.52 - 0.52, 0, Math.floor(index / 3) * 0.42);
+        visual.add(rack);
       }
     });
   }
@@ -2409,19 +2779,33 @@ export class SceneController {
           color: baseColor,
           roughness: 0.78,
         });
-        const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.4, 0.22), material);
+        material.userData.workerTintable = true;
+        const geometry = new THREE.BoxGeometry(
+          0.22 * SIMULATION_WORKER_FALLBACK_SCALE,
+          0.4 * SIMULATION_WORKER_FALLBACK_SCALE,
+          0.22 * SIMULATION_WORKER_FALLBACK_SCALE,
+        );
+        const fallback = new THREE.Mesh(geometry, material);
+        fallback.position.y = 0.2 * SIMULATION_WORKER_FALLBACK_SCALE;
+        fallback.castShadow = true;
+        const mesh = new THREE.Group();
+        mesh.add(fallback);
         const offset = 0.38 + workerIndex * 0.2;
         mesh.position.set(
           homePosition.x + pathDirection.x * offset,
-          this.settings.rockHeight + TOP_LIFT + 0.2,
+          this.settings.rockHeight + TOP_LIFT,
           homePosition.y + pathDirection.y * offset,
         );
-        mesh.castShadow = true;
         mesh.name = `Worker from house ${buildingIndex + 1}`;
         this.simulationLayer.add(mesh);
         this.runState.workers.push(workerState);
-        this.simulationWorkers.push({
+        const worker: SimulationWorker = {
           mesh,
+          materials: [material],
+          disposableGeometry: geometry,
+          driver: null,
+          walkPhase: 0,
+          isMoving: false,
           state: workerState,
           baseColor,
           homeBuildingIndex: buildingIndex,
@@ -2433,17 +2817,66 @@ export class SceneController {
           laneOffset: workerIndex === 0
             ? -SIMULATION_WORKER_LANE_OFFSET
             : SIMULATION_WORKER_LANE_OFFSET,
-        });
+        };
+        this.simulationWorkers.push(worker);
+        void this.replaceWorkerFallbackWithModel(worker, fallback);
       }
     });
     this.updateSimulationWorkerPanel();
   }
 
+  private async replaceWorkerFallbackWithModel(
+    worker: SimulationWorker,
+    fallback: THREE.Mesh,
+  ): Promise<void> {
+    try {
+      const source = (await workerModelPromise).scene;
+      if (!worker.mesh.parent || !this.simulationWorkers.includes(worker)) {
+        return;
+      }
+
+      const model = source.clone(true);
+      const materials: THREE.MeshStandardMaterial[] = [];
+      model.traverse((object) => {
+        if (!(object instanceof THREE.Mesh)) {
+          return;
+        }
+        object.castShadow = true;
+        object.receiveShadow = true;
+        const sourceMaterials = Array.isArray(object.material) ? object.material : [object.material];
+        const clonedMaterials = sourceMaterials.map((sourceMaterial) => {
+          const material = sourceMaterial.clone() as THREE.MeshStandardMaterial;
+          material.userData.workerTintable = sourceMaterial.name === 'worker_blue_shirt';
+          materials.push(material);
+          return material;
+        });
+        object.material = Array.isArray(object.material) ? clonedMaterials : clonedMaterials[0];
+      });
+
+      const bounds = new THREE.Box3().setFromObject(model);
+      model.scale.setScalar(SIMULATION_WORKER_MODEL_SCALE);
+      model.position.y = -bounds.min.y * SIMULATION_WORKER_MODEL_SCALE;
+      model.name = 'Worker GLB model';
+
+      fallback.removeFromParent();
+      worker.disposableGeometry?.dispose();
+      worker.materials.forEach((material) => material.dispose());
+      worker.disposableGeometry = null;
+      worker.materials = materials;
+      worker.mesh.add(model);
+      worker.driver = new WorkerCharacterDriver(model);
+      this.updateWorkerMaterialColors(worker);
+      this.updateWorkerSelectionMaterial(worker);
+    } catch (error) {
+      console.warn('Could not load worker model; keeping primitive fallback.', error);
+    }
+  }
+
   private clearSimulationWorkers(): void {
     this.simulationWorkers.forEach((worker) => {
       worker.mesh.removeFromParent();
-      worker.mesh.geometry.dispose();
-      worker.mesh.material.dispose();
+      worker.disposableGeometry?.dispose();
+      worker.materials.forEach((material) => material.dispose());
     });
     this.simulationWorkers.length = 0;
     this.runState.workers.length = 0;
@@ -2529,9 +2962,19 @@ export class SceneController {
 
   private setWorkerTaskState(worker: SimulationWorker, state: WorkerTaskState): void {
     worker.state.taskState = state;
-    const stateColor = WORKER_STATE_COLORS[state];
-    worker.mesh.material.color.setHex(state === 'idle' ? worker.baseColor : stateColor);
+    this.updateWorkerMaterialColors(worker);
     this.updateSimulationWorkerPanel();
+  }
+
+  private updateWorkerMaterialColors(worker: SimulationWorker): void {
+    const color = worker.state.taskState === 'idle'
+      ? worker.baseColor
+      : WORKER_STATE_COLORS[worker.state.taskState];
+    worker.materials.forEach((material) => {
+      if (material.userData.workerTintable === true) {
+        material.color.setHex(color);
+      }
+    });
   }
 
   private beginWorkerOrder(
@@ -2602,14 +3045,6 @@ export class SceneController {
   private issueOneShotWorkerOrder(worker: SimulationWorker, buildingIndex: number): 'gather' | 'deliver' | 'invalid' {
     const prefab = this.placedPrefabs[buildingIndex];
     if (!prefab) {
-      return 'invalid';
-    }
-    if (
-      prefab.key === 'launchPad' &&
-      !this.runState.construction.launchFieldComplete &&
-      worker.state.cargo.includes('fireworks') &&
-      !worker.state.cargo.some((resource) => resource === 'wood' || resource === 'stone')
-    ) {
       return 'invalid';
     }
 
@@ -2779,17 +3214,9 @@ export class SceneController {
     }
     this.placedPrefabs.forEach((prefab, buildingIndex) => {
       const valid = selectedWorkers.some(
-        (worker) => {
-          const launchBlocked =
-            prefab.key === 'launchPad' &&
-            !this.runState.construction.launchFieldComplete &&
-            worker.state.cargo.includes('fireworks') &&
-            !worker.state.cargo.some((resource) => resource === 'wood' || resource === 'stone');
-          return !launchBlocked && (
-            acceptsAnyCargo(prefab.key, worker.state.cargo) ||
-            this.canGatherAtBuilding(worker, buildingIndex)
-          );
-        },
+        (worker) =>
+          acceptsAnyCargo(prefab.key, worker.state.cargo) ||
+          this.canGatherAtBuilding(worker, buildingIndex),
       );
       if (!valid) {
         return;
@@ -3036,6 +3463,7 @@ export class SceneController {
 
   private updateSimulationWorkers(deltaSeconds: number): void {
     this.simulationWorkers.forEach((worker) => {
+      worker.isMoving = false;
       if (worker.state.taskState === 'gathering') {
         this.updateWorkerGathering(worker, deltaSeconds);
         return;
@@ -3048,6 +3476,8 @@ export class SceneController {
         return;
       }
 
+      const startX = worker.mesh.position.x;
+      const startZ = worker.mesh.position.z;
       const hadRoute = worker.routeNodeIds.length > 0;
       let remainingMovement = worker.speed * deltaSeconds;
       while (remainingMovement > 0 && worker.routeIndex < worker.routeNodeIds.length) {
@@ -3082,9 +3512,31 @@ export class SceneController {
           this.handleWorkerArrival(worker);
         }
       }
+
+      const movedX = worker.mesh.position.x - startX;
+      const movedZ = worker.mesh.position.z - startZ;
+      const movedDistance = Math.hypot(movedX, movedZ);
+      worker.isMoving = movedDistance > 0.00001;
+      if (worker.isMoving) {
+        worker.mesh.rotation.y = Math.atan2(movedX, movedZ);
+        worker.walkPhase = (worker.walkPhase + movedDistance / SIMULATION_WORKER_STRIDE_LENGTH) % 1;
+      }
     });
     this.resolveSimulationWorkerCrowding();
     this.updateSimulationWorkerPanel();
+  }
+
+  private updateWorkerWalkPoses(allowWalking: boolean): void {
+    this.simulationWorkers.forEach((worker) => {
+      if (!worker.driver) {
+        return;
+      }
+      if (allowWalking && worker.isMoving && worker.mesh.visible) {
+        worker.driver.applyWalkCycle(worker.walkPhase);
+      } else {
+        worker.driver.reset();
+      }
+    });
   }
 
   private getWorkerRouteTarget(
@@ -3214,7 +3666,8 @@ export class SceneController {
   private updateSimulationSpeedButton(): void {
     const button = document.querySelector<HTMLButtonElement>('.simulation-hud__speed');
     if (button) {
-      button.textContent = `${this.runState.clock.speed}×`;
+      button.textContent =
+        this.runState.clock.speed === 1 ? '▶' : this.runState.clock.speed === 2 ? '▶▶' : '▶▶▶';
       button.setAttribute('aria-label', `Simulation speed ${this.runState.clock.speed}x`);
     }
   }
@@ -3292,7 +3745,11 @@ export class SceneController {
     const cargoElement = document.querySelector<HTMLElement>('.simulation-resource-hud__cargo');
     const capacityElement = document.querySelector<HTMLElement>('.simulation-resource-hud__capacity');
     if (cargoElement) {
-      cargoElement.textContent = `In transit: ${cargo.length} (${summarizeResources(cargo)})`;
+      const cargoValue = cargoElement.querySelector('strong');
+      if (cargoValue) {
+        cargoValue.textContent = String(cargo.length);
+      }
+      cargoElement.title = summarizeResources(cargo);
     }
     if (capacityElement) {
       capacityElement.textContent =
@@ -3307,21 +3764,10 @@ export class SceneController {
     this.simulationWorkers.forEach((worker) => this.setWorkerSelected(worker, false));
     if (this.runState.clock.day >= SIMULATION_FINAL_DAY) {
       this.runState.result = resolveRunResult(this.runState);
-      this.startFireworksFinale(this.runState.result.launched);
-      return;
     }
-    this.showDayResultModal();
-  }
-
-  private showDayResultModal(): void {
     const modal = document.querySelector<HTMLElement>('.day-modal');
     const title = document.querySelector<HTMLElement>('#day-modal-title');
     const summary = document.querySelector<HTMLElement>('.day-modal__summary');
-    const metrics = document.querySelector<HTMLElement>('.day-modal__metrics');
-    const button = document.querySelector<HTMLButtonElement>('.day-modal__button');
-    const daySummary = this.runState.daySummaries.find(
-      (entry) => entry.day === this.runState.clock.day,
-    );
     if (title) {
       title.textContent = this.runState.result
         ? this.runState.result.success
@@ -3330,172 +3776,30 @@ export class SceneController {
         : "Today's progress";
     }
     if (summary) {
+      const daySummary = this.runState.daySummaries.find(
+        (entry) => entry.day === this.runState.clock.day,
+      );
       summary.textContent = this.runState.result
-        ? this.runState.result.reaction
-        : `July ${this.runState.clock.day} complete. Reassign everyone tomorrow morning.`;
-    }
-    if (metrics) {
-      const entries = this.runState.result
-        ? [
-          `Produced ${this.runState.result.produced}`,
-          `Staged ${this.runState.result.staged}`,
-          `Capacity ${this.runState.result.capacity}`,
-          `Launched ${this.runState.result.launched}`,
-          `Unlaunchable ${this.runState.result.wasted}`,
-          `Grade ${this.runState.result.grade}`,
-        ]
-        : [
-          `Gathered ${daySummary ? summarizeResources(inventoryToResourceList(daySummary.gathered)) : '0'}`,
-          `Delivered ${daySummary ? summarizeResources(inventoryToResourceList(daySummary.delivered)) : '0'}`,
-          `Produced ${daySummary?.produced ?? 0}`,
-          `Field ${Math.round((daySummary?.launchFieldProgress ?? 0) * 100)}%`,
-          `Racks ${daySummary?.launchRacks ?? 0} · staged ${daySummary?.staged ?? 0}`,
-          `Cargo wasted ${daySummary?.discardedCargo ?? 0}`,
-        ];
-      metrics.replaceChildren(...entries.map((text) => {
-        const element = document.createElement('span');
-        element.textContent = text;
-        return element;
-      }));
-    }
-    if (button) {
-      button.textContent = this.runState.result ? 'Restart' : 'Start Next Day';
+        ? `${this.runState.result.reaction} Produced ${this.runState.result.produced} · staged ${this.runState.result.staged} · capacity ${this.runState.result.capacity} · launched ${this.runState.result.launched} · unlaunchable ${this.runState.result.wasted}.`
+        : `${this.runState.fireworks.produced} produced · ${this.runState.fireworks.staged} staged · ${getLaunchCapacity(this.runState)} capacity · ${daySummary?.discardedCargo ?? 0} cargo discarded at cutoff.`;
     }
     modal?.removeAttribute('hidden');
-    button?.focus();
-  }
-
-  private startFireworksFinale(launchCount: number): void {
-    this.stopFireworksFinale();
-    const launchIndex = this.placedPrefabs.findIndex((prefab) => prefab.key === 'launchPad');
-    const launchPrefab = this.placedPrefabs[launchIndex];
-    const launchCenter = launchPrefab
-      ? getPrefabWorldCenter(getPrefabDefinition(launchPrefab.key), launchPrefab.placement)
-      : new THREE.Vector2();
-    this.fireworksFinale = {
-      plan: createFireworksShowPlan(launchCount, 40704),
-      startedAtSeconds: performance.now() / 1000,
-      nextBurstIndex: 0,
-      origin: new THREE.Vector3(launchCenter.x, this.settings.rockHeight, launchCenter.y),
-      bursts: [],
-      cameraPosition: this.camera.position.clone(),
-      cameraTarget: this.controls.target.clone(),
-    };
-    this.scene.background = new THREE.Color(0x071329);
-    this.scene.fog = new THREE.Fog(0x071329, 28, 64);
-    this.sunLight.intensity = 0.18;
-    this.ambientLight.intensity = 0.65;
-    this.rimLight.intensity = 0.35;
-    this.fillLight.intensity = 0.12;
-    this.controls.enabled = false;
-    this.controls.target.copy(this.fireworksFinale.origin).add(new THREE.Vector3(0, 3.5, 0));
-    this.camera.position.copy(this.fireworksFinale.origin).add(new THREE.Vector3(8, 7.5, 9));
-    this.camera.lookAt(this.controls.target);
-    document.querySelector<HTMLElement>('.simulation-worker-panel')?.setAttribute('hidden', '');
-    document.querySelector<HTMLElement>('.simulation-building-panel')?.setAttribute('hidden', '');
-    document.querySelector<HTMLElement>('.simulation-objective-panel')?.setAttribute('hidden', '');
-    document.querySelector<HTMLElement>('.simulation-resource-hud')?.setAttribute('hidden', '');
-    this.showSimulationNotice(
-      launchCount > 0 ? `${launchCount} fireworks launching!` : 'No fireworks were ready to launch.',
-    );
-  }
-
-  private spawnFireworkBurst(finale: FireworksFinaleState, plan: FireworkBurstPlan): void {
-    const directions = createBurstDirections(plan);
-    const positions = new Float32Array(plan.particleCount * 3);
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const material = new THREE.PointsMaterial({
-      color: plan.color,
-      size: 0.09 * plan.size,
-      transparent: true,
-      opacity: 1,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      sizeAttenuation: true,
-    });
-    const points = new THREE.Points(geometry, material);
-    points.name = `Firework burst ${plan.index + 1}`;
-    this.fireworksLayer.add(points);
-    finale.bursts.push({
-      points,
-      plan,
-      directions,
-      startedAtSeconds: finale.startedAtSeconds + plan.launchAtSeconds,
-    });
-  }
-
-  private updateFireworksFinale(nowSeconds: number): void {
-    const finale = this.fireworksFinale;
-    if (!finale) {
-      return;
-    }
-    const elapsed = nowSeconds - finale.startedAtSeconds;
-    while (
-      finale.nextBurstIndex < finale.plan.bursts.length &&
-      finale.plan.bursts[finale.nextBurstIndex].launchAtSeconds <= elapsed
-    ) {
-      this.spawnFireworkBurst(finale, finale.plan.bursts[finale.nextBurstIndex]);
-      finale.nextBurstIndex += 1;
-    }
-    for (let index = finale.bursts.length - 1; index >= 0; index -= 1) {
-      const burst = finale.bursts[index];
-      const age = nowSeconds - burst.startedAtSeconds;
-      const progress = age / burst.plan.lifetimeSeconds;
-      if (progress >= 1) {
-        burst.points.removeFromParent();
-        burst.points.geometry.dispose();
-        burst.points.material.dispose();
-        finale.bursts.splice(index, 1);
-        continue;
-      }
-      const positions = burst.points.geometry.getAttribute('position') as THREE.BufferAttribute;
-      burst.directions.forEach((direction, particleIndex) => {
-        const speed = 2.1 * burst.plan.size;
-        positions.setXYZ(
-          particleIndex,
-          finale.origin.x + burst.plan.x + direction[0] * speed * age,
-          finale.origin.y + burst.plan.y + direction[1] * speed * age - 1.25 * age * age,
-          finale.origin.z + burst.plan.z + direction[2] * speed * age,
-        );
-      });
-      positions.needsUpdate = true;
-      burst.points.material.opacity = Math.max(0, 1 - progress * progress);
-    }
-    if (
-      elapsed >= finale.plan.durationSeconds + 1.5 &&
-      finale.bursts.length === 0
-    ) {
-      this.stopFireworksFinale();
-      this.showDayResultModal();
-    }
-  }
-
-  private stopFireworksFinale(): void {
-    const finale = this.fireworksFinale;
-    if (!finale) {
-      return;
-    }
-    finale.bursts.forEach((burst) => {
-      burst.points.removeFromParent();
-      burst.points.geometry.dispose();
-      burst.points.material.dispose();
-    });
-    this.fireworksLayer.clear();
-    this.camera.position.copy(finale.cameraPosition);
-    this.controls.target.copy(finale.cameraTarget);
-    this.camera.lookAt(this.controls.target);
-    this.fireworksFinale = null;
-    this.applyVibe();
-    this.controls.enabled = this.interactionMode === 'simulate';
+    document.querySelector<HTMLButtonElement>('.day-modal__button')?.focus();
   }
 
   private setWorkerSelected(worker: SimulationWorker, selected: boolean): void {
     worker.selected = selected;
-    worker.mesh.material.emissive.setHex(selected ? 0xf4d17a : 0x000000);
-    worker.mesh.material.emissiveIntensity = selected ? 0.65 : 0;
+    this.updateWorkerSelectionMaterial(worker);
     this.updateSimulationWorkerPanel();
     this.updateValidTargetHighlights();
+  }
+
+  private updateWorkerSelectionMaterial(worker: SimulationWorker): void {
+    worker.materials.forEach((material) => {
+      const selectedTintable = worker.selected && material.userData.workerTintable === true;
+      material.emissive.setHex(selectedTintable ? 0xf4d17a : 0x000000);
+      material.emissiveIntensity = selectedTintable ? 0.22 : 0;
+    });
   }
 
   private updateSimulationWorkerPanel(): void {
@@ -3785,6 +4089,7 @@ export class SceneController {
     this.canvas.removeEventListener('pointerleave', this.clearSimulationBuildingHover);
     window.removeEventListener('keydown', this.handleKeyDown);
     this.stopSimulation();
+    this.clearFireworksShow();
     this.clearPrefabPlacements(false);
     this.removePrefabPreview();
     this.controls.dispose();
@@ -4261,21 +4566,8 @@ export class SceneController {
     const vibeFolder = gui.addFolder('Vibe of Day');
     const vibeControllers: Array<{ updateDisplay: () => unknown }> = [];
     const syncVibePreset = (): void => {
-      const preset = resolveVibe(this.vibeSettings);
-      this.vibeSettings.sunHeight = preset.sunHeight;
-      this.vibeSettings.sunWarmth = preset.sunWarmth;
-      this.vibeSettings.sunBrightness = preset.sunBrightness;
-      this.vibeSettings.ambientWarmth = preset.ambientWarmth;
-      this.vibeSettings.shadowLift = preset.shadowLift;
-      this.vibeSettings.contrastSoftness = preset.contrastSoftness;
-      this.vibeSettings.saturation = preset.saturation;
-      this.vibeSettings.warmMidtones = preset.warmMidtones;
-      this.vibeSettings.blueShadowTint = preset.blueShadowTint;
-      this.vibeSettings.waterMood = preset.waterMood;
-      this.vibeSettings.grassWarmth = preset.grassWarmth;
-      this.vibeSettings.rockWarmth = preset.rockWarmth;
+      this.syncVibePresetToCurrentSelection(false);
       vibeControllers.forEach((controller) => controller.updateDisplay());
-      this.applyVibe();
     };
     trackController(vibeFolder.add(this.vibeSettings, 'preset', VIBE_PRESET_NAMES).name('Vibe preset').onChange(syncVibePreset));
     trackController(vibeFolder.add(this.vibeSettings, 'blend', 0, 1, 0.01).name('Vibe blend').onChange(syncVibePreset));
@@ -4453,6 +4745,9 @@ export class SceneController {
   }
 
   private updateOceanFog(vibe = this.getCurrentVibe()): void {
+    this.waterMaterial.uniforms.uEdgeFogStrength.value = this.waterSettings.edgeFog ? 1 : 0;
+    this.waterMaterial.uniforms.uEdgeFogColor.value.set(vibe.background);
+
     if (!this.waterSettings.edgeFog) {
       this.scene.fog = null;
       return;
@@ -4475,11 +4770,28 @@ export class SceneController {
     this.scene.fog = new THREE.Fog(fogColor, near, far);
   }
 
+  private updateSimulationWeatherIcon(): void {
+    const weather = document.querySelector<HTMLElement>('.simulation-hud__weather');
+    if (!weather) {
+      return;
+    }
+    const vibe = this.getCurrentVibe();
+    weather.textContent = this.vibeSettings.preset === 'Warm Lantern Night' || vibe.sunHeight <= 0.32
+      ? '🌙'
+      : vibe.sunHeight <= 0.4
+        ? '🌆'
+        : '☀';
+  }
+
   private applyVibe(): void {
     const vibe = this.getCurrentVibe();
     const background = new THREE.Color(vibe.background);
     const waterPalette = getVibeWaterPalette(vibe);
     this.scene.background = background;
+    this.oceanEdgeFogOverlay?.style.setProperty(
+      '--ocean-edge-fog-rgb',
+      `${Math.round(background.r * 255)} ${Math.round(background.g * 255)} ${Math.round(background.b * 255)}`,
+    );
     this.updateOceanFog(vibe);
 
     const sunDistance = 25;
@@ -4550,6 +4862,7 @@ export class SceneController {
       });
     });
     this.updateShoreRippleVibe(vibe);
+    this.updateSimulationWeatherIcon();
   }
 
   private getSelectedPrefabDefinition() {
@@ -5219,9 +5532,16 @@ export class SceneController {
       -((event.clientY - bounds.top) / bounds.height) * 2 + 1,
     );
     this.raycaster.setFromCamera(this.pointer, this.camera);
-    const hits = this.raycaster.intersectObjects(this.simulationWorkers.map((worker) => worker.mesh), false);
-    const hitMesh = hits[0]?.object;
-    return this.simulationWorkers.find((worker) => worker.mesh === hitMesh) ?? null;
+    const hits = this.raycaster.intersectObjects(this.simulationWorkers.map((worker) => worker.mesh), true);
+    let hitObject: THREE.Object3D | null = hits[0]?.object ?? null;
+    while (hitObject) {
+      const worker = this.simulationWorkers.find((candidate) => candidate.mesh === hitObject);
+      if (worker) {
+        return worker;
+      }
+      hitObject = hitObject.parent;
+    }
+    return null;
   }
 
   private getPrefabIndexAtPointer(event: PointerEvent): number | null {
@@ -5239,6 +5559,9 @@ export class SceneController {
         continue;
       }
       const index = this.placedPrefabs.indexOf(prefab);
+      if (prefab.key === 'house' || prefab.key === 'plaza') {
+        continue;
+      }
       return index >= 0 ? index : null;
     }
     return null;
@@ -5541,6 +5864,19 @@ export class SceneController {
     const deltaSeconds = Math.max(0, (now - this.lastFrameTime) / 1000);
     this.lastFrameTime = now;
     this.controls.update();
+    if (this.oceanEdgeFogOverlay) {
+      const lowAngleFog = THREE.MathUtils.smoothstep(
+        this.controls.getPolarAngle(),
+        1.18,
+        this.controls.maxPolarAngle - 0.015,
+      );
+      this.oceanCutoffProbe
+        .set(this.camera.position.x, 0, this.camera.position.z)
+        .project(this.camera);
+      const cutoffPercent = THREE.MathUtils.clamp((1 - this.oceanCutoffProbe.y) * 50, 0, 100);
+      this.oceanEdgeFogOverlay.style.setProperty('--ocean-edge-fog-line', `${cutoffPercent.toFixed(2)}%`);
+      this.oceanEdgeFogOverlay.style.opacity = lowAngleFog.toFixed(3);
+    }
     if (this.runState.clock.running && !this.runState.clock.paused) {
       const fixedStepResult = runFixedSimulationSteps(
         this.simulationAccumulatorSeconds,
@@ -5552,10 +5888,11 @@ export class SceneController {
     } else {
       this.simulationAccumulatorSeconds = 0;
     }
+    this.updateWorkerWalkPoses(this.runState.clock.running && !this.runState.clock.paused);
     this.updateSimulationNotice(now);
     this.clearOrderConfirmations(now);
-    this.updateFireworksFinale(now * 0.001);
     this.updateWaterAnimation(now * 0.001);
+    this.updateFireworksShow(now * 0.001);
     this.renderer.render(this.scene, this.camera);
   };
 }

@@ -24,5 +24,6 @@ test('small, medium, and maximum shows scale duration and density safely', () =>
   assert.ok(medium.durationSeconds <= large.durationSeconds);
   assert.equal(large.launchedCount, MAX_FIREWORKS_SHOW_COUNT);
   assert.equal(large.bursts.length, MAX_FIREWORKS_SHOW_COUNT);
-  assert.ok(large.bursts.every((burst) => burst.particleCount <= 48));
+  assert.ok(large.bursts.every((burst) => burst.particleCount <= 66));
+  assert.ok(large.bursts.every((burst) => burst.lifetimeSeconds <= 2.5));
 });
