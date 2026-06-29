@@ -145,7 +145,7 @@ docs/           Design and balance notes
 
 ## Notes for contributors
 
-- The main browser entry point is [src/main.ts](/C:/repos/summer-into-ai/boomtown/src/main.ts).
-- Most gameplay state and rules live under [src/simulation](/C:/repos/summer-into-ai/boomtown/src/simulation).
-- The interactive 3D runtime is coordinated by [src/scene/SceneController.ts](/C:/repos/summer-into-ai/boomtown/src/scene/SceneController.ts).
-- Balance expectations and target playtest outcomes are documented in [docs/balance.md](/C:/repos/summer-into-ai/boomtown/docs/balance.md).
+- The main browser entry point is [src/main.ts](./src/main.ts).
+- Most gameplay state and rules live under [src/simulation](./src/simulation).
+- The interactive 3D runtime is coordinated by [src/scene/SceneController.ts](./src/scene/SceneController.ts).
+- Balance expectations and target playtest outcomes are documented in [docs/balance.md](./docs/balance.md).
